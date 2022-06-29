@@ -24,7 +24,7 @@ brew install sox
 
 ### For Windows
 
-[Download the binaries](http://sourceforge.net/projects/sox/files/latest/downlo
+[Download the binaries](http://sourceforge.net/projects/sox/files/latest/download)
 
 ## install
 
