@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "axios": "^0.27.2",
+    "jsonwebtoken": "^8.5.1",
+    "node-audiorecorder": "^3.0.0",
+    "ws": "^8.8.0"
+  }
+}
