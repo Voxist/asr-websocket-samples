@@ -1,8 +1,29 @@
 {
+  "name": "asr-websocket-samples",
+  "version": "1.0.0",
+  "description": "WebSocket client samples for Voxist ASR service",
+  "type": "module",
+  "main": "asr-file-ws.js",
+  "scripts": {
+    "start": "node asr-file-ws.js",
+    "test-js": "node asr-file-ws.js",
+    "test-py": "python asr-file-ws.py"
+  },
+  "keywords": [
+    "asr",
+    "speech",
+    "recognition",
+    "websocket",
+    "voxist"
+  ],
+  "license": "MIT",
   "dependencies": {
-    "axios": "^0.27.2",
-    "jsonwebtoken": "^8.5.1",
+    "axios": "^1.6.7",
+    "jsonwebtoken": "^9.0.2",
     "node-audiorecorder": "^3.0.0",
-    "ws": "^8.8.0"
+    "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
   }
 }

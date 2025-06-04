@@ -1,1 +1,19 @@
 node_modules/*
+
+# Python virtual environment
+venv/
+env/
+.venv/
+.env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Python egg info
+*.egg-info/
+dist/
+build/
