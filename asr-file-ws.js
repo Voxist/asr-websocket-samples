@@ -1,4 +1,4 @@
-import websocket from 'ws';
+import WebSocket from 'ws';
 import fs from 'fs';
 
 // Parse command line arguments
@@ -70,7 +70,7 @@ console.log(`Sample rate: ${sampleRate} Hz`);
 console.log(`Chunk size: ${CHUNK_SIZE} bytes`);
 console.log('');
 
-const ws = new websocket(url);
+const ws = new WebSocket(url);
 let start = Date.now();
 let first = true;
 let lastSegment = null;
@@ -89,14 +89,18 @@ ws.on('open', async () => {
   start = Date.now();
 
   readStream.on('data', async (chunk) => {
-    readStream.pause();
-    ws.send(chunk);
-    await new Promise((resolve) => setTimeout(resolve, CHUNK_DURATION_MS));
-    readStream.resume();
+    if (ws.readyState === WebSocket.OPEN) {
+      readStream.pause();
+      ws.send(chunk);
+      await new Promise((resolve) => setTimeout(resolve, CHUNK_DURATION_MS));
+      readStream.resume();
+    }
   });
 
   readStream.on('end', () => {
-    ws.send('{"eof": 1}');
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send('{"eof": 1}');
+    }
   });
 
   readStream.on('error', (error) => {
@@ -121,7 +125,7 @@ ws.on('message', (data) => {
       } else if (message.type === 'final') {
         // Clear the partial result and print final result on new line
         clearLine();
-        // Only print if it's a new segment AND we haven't seen this exact text before
+        // Only print if it's a new segment
         const currentSegment = message.segment;
         if (currentSegment !== lastSegment) {
           console.log(message.text);
@@ -136,6 +140,8 @@ ws.on('message', (data) => {
 
 ws.on('error', (error) => {
   console.error(`WebSocket error: ${error.message}`);
+  console.error(`Failed to connect to: ${url}`);
+  process.exit(1);
 });
 
 ws.on('close', (code, reason) => {

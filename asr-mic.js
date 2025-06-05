@@ -185,7 +185,7 @@ async function startTranscription() {
             // Only print if it's a new segment
             const currentSegment = message.segment;
             if (currentSegment !== lastSegment) {
-              console.log(`[FINAL] ${message.text}`, message);
+              console.log(`[FINAL] ${message.text}`);
               lastSegment = currentSegment;
             }
           }
