@@ -3,7 +3,7 @@
 This repository contains WebSocket client samples for the Voxist ASR (Automatic Speech Recognition) service in both JavaScript and Python.
 
 ## OpenAPI documentation is available 
-Go [there](https://asr-lvl.voxist.com/api-documentation/).
+Go [there](https://api-asr.voxist.com/api-documentation/).
 
 ## Account @voxist required.
 [Contact us](mailto:contact@voxist.com) if interested.

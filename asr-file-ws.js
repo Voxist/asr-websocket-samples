@@ -12,21 +12,26 @@ if (isStaging) {
 }
 
 if (args.length < 2) {
-  console.log('Usage: node asr-file-ws.js <API_KEY> <WAV_FILE> [LANG] [SAMPLE_RATE] [--staging]');
-  console.log('Example: node asr-file-ws.js your-api-key audio.wav fr-medical 16000');
-  console.log('Example: node asr-file-ws.js your-staging-api-key audio.wav fr-medical 16000 --staging');
+  console.log('Usage: node asr-file-ws.js <API_KEY> <WAV_FILE> [LANG] [--staging]');
+  console.log('Example: node asr-file-ws.js your-api-key audio.wav fr');
+  console.log('Example: node asr-file-ws.js your-staging-api-key audio.wav fr-medical --staging');
   console.log('');
   console.log('Parameters:');
   console.log('  API_KEY: Your Voxist API key');
   console.log('  WAV_FILE: Path to the WAV audio file');
-  console.log('  LANG: Language code (optional, default: "fr-medical")');
-  console.log('  SAMPLE_RATE: Sample rate in Hz (optional, default: 16000)');
+  console.log('  LANG: Language code (optional, default: "fr")');
   console.log('  --staging: Use staging environment (optional)');
   console.log('');
   console.log('Supported Languages:');
   console.log('  fr: French');
   console.log('  fr-medical: French Medical');
   console.log('  en: English');
+  console.log('  pt: Portuguese');
+  console.log('  nl: Dutch');
+  console.log('  it: Italian');
+  console.log('  sv: Swedish');
+  console.log('  es: Spanish');
+  console.log('  de: German');
   console.log('');
   console.log('Environments:');
   console.log('  Production: api-asr.voxist.com (default)');
@@ -38,8 +43,8 @@ if (args.length < 2) {
 
 const apiKey = args[0];
 const wavFilePath = args[1];
-const lang = args[2] || 'fr-medical';
-const sampleRate = parseInt(args[3]) || 16000;
+const lang = args[2] || 'fr';
+const sampleRate = 16000;
 
 // Validate file exists
 if (!fs.existsSync(wavFilePath)) {

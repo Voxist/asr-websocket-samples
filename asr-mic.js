@@ -12,34 +12,39 @@ if (isStaging) {
 }
 
 if (args.length < 1) {
-  console.log('Usage: node asr-mic.js <API_KEY> [LANG] [SAMPLE_RATE] [--staging]');
-  console.log('Example: node asr-mic.js your-api-key fr-medical 16000');
-  console.log('Example: node asr-mic.js your-staging-api-key fr-medical 16000 --staging');
+  console.log('Usage: node asr-mic.js <API_KEY> [LANG] [--staging]');
+  console.log('Example: node asr-mic.js your-api-key fr');
+  console.log('Example: node asr-mic.js your-staging-api-key fr-medical --staging');
   console.log('');
   console.log('Parameters:');
   console.log('  API_KEY: Your Voxist API key');
-  console.log('  LANG: Language code (optional, default: "fr-medical")');
-  console.log('  SAMPLE_RATE: Sample rate in Hz (optional, default: 16000)');
+  console.log('  LANG: Language code (optional, default: "fr")');
   console.log('  --staging: Use staging environment (optional)');
   console.log('');
   console.log('Supported Languages:');
   console.log('  fr: French');
   console.log('  fr-medical: French Medical');
   console.log('  en: English');
+  console.log('  pt: Portuguese');
+  console.log('  nl: Dutch');
+  console.log('  it: Italian');
+  console.log('  sv: Swedish');
+  console.log('  es: Spanish');
+  console.log('  de: German');
   console.log('');
   console.log('Environments:');
   console.log('  Production: api-asr.voxist.com (default)');
   console.log('  Staging: asr-staging-dev.voxist.com (with --staging flag)');
   console.log('');
   console.log('Note: This requires SoX to be installed and available in PATH');
-  console.log('Audio will be recorded as mono 16-bit at the specified sample rate');
+  console.log('Audio will be recorded as mono 16-bit at 16kHz sample rate');
   console.log('Note: Staging and production use different API keys');
   process.exit(1);
 }
 
 const apiKey = args[0];
-const lang = args[1] || 'fr-medical';
-const sampleRate = parseInt(args[2]) || 16000;
+const lang = args[1] || 'fr';
+const sampleRate = 16000;
 
 // Select the appropriate domain based on staging flag
 const domain = isStaging ? 'asr-staging-dev.voxist.com' : 'api-asr.voxist.com';

@@ -129,22 +129,26 @@ def main():
         args.remove('--staging')
     
     if len(args) < 2:
-        print("Usage: python asr-file-ws.py <API_KEY> <WAV_FILE> [LANG] [SAMPLE_RATE] [--staging]")
-        print("Example: python asr-file-ws.py your-api-key audio.wav fr-medical 16000")
-        print("Example: python asr-file-ws.py your-staging-api-key audio.wav fr-medical 16000 --staging")
+        print("Usage: python asr-file-ws.py <API_KEY> <WAV_FILE> [LANG] [--staging]")
+        print("Example: python asr-file-ws.py your-api-key audio.wav fr")
+        print("Example: python asr-file-ws.py your-staging-api-key audio.wav fr-medical --staging")
         print("")
         print("Parameters:")
         print("  API_KEY: Your Voxist API key")
         print("  WAV_FILE: Path to the WAV audio file")
-        print("  LANG: Language code (optional, default: 'fr-medical')")
-        print("  SAMPLE_RATE: Sample rate in Hz (optional, default: 16000)")
+        print("  LANG: Language code (optional, default: 'fr')")
         print("  --staging: Use staging environment (optional)")
         print("")
         print("Supported Languages:")
         print("  fr: French")
         print("  fr-medical: French Medical")
         print("  en: English")
-        print("  en-medical: English Medical")
+        print("  pt: Portuguese")
+        print("  nl: Dutch")
+        print("  it: Italian")
+        print("  sv: Swedish")
+        print("  es: Spanish")
+        print("  de: German")
         print("")
         print("Environments:")
         print("  Production: api-asr.voxist.com (default)")
@@ -155,8 +159,8 @@ def main():
     
     api_key = args[0]
     wav_file = args[1]
-    lang = args[2] if len(args) > 2 else "fr-medical"
-    sample_rate = int(args[3]) if len(args) > 3 else 16000
+    lang = args[2] if len(args) > 2 else "fr"
+    sample_rate = 16000
     
     client = ASRWebSocketClient(wav_file, api_key, lang, sample_rate, is_staging)
     asyncio.run(client.run())
