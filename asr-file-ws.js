@@ -1,5 +1,13 @@
 import WebSocket from 'ws';
 import fs from 'fs';
+import { readWavInfo, assertStreamable } from './wav.js';
+
+// Only 16 kHz is served by the streaming engines. The gateway does not resample,
+// so this is not a knob — it is a property of the audio you must supply.
+const SAMPLE_RATE = 16000;
+const BYTES_PER_SAMPLE = 2;
+const CHUNK_DURATION_MS = 100;
+const CHUNK_SIZE = Math.floor(SAMPLE_RATE * BYTES_PER_SAMPLE * (CHUNK_DURATION_MS / 1000));
 
 // Parse command line arguments
 const args = process.argv.slice(2);
@@ -18,20 +26,20 @@ if (args.length < 2) {
   console.log('');
   console.log('Parameters:');
   console.log('  API_KEY: Your Voxist API key');
-  console.log('  WAV_FILE: Path to the WAV audio file');
+  console.log('  WAV_FILE: Path to the WAV audio file (16 kHz mono 16-bit PCM)');
   console.log('  LANG: Language code (optional, default: "fr")');
   console.log('  --staging: Use staging environment (optional)');
   console.log('');
   console.log('Supported Languages:');
   console.log('  fr: French');
   console.log('  fr-medical: French Medical');
+  console.log('  fr-medicalV2-16 / fr-medicalV2-32 / fr-medicalV2-64: French Medical latency tiers');
   console.log('  en: English');
-  console.log('  pt: Portuguese');
-  console.log('  nl: Dutch');
-  console.log('  it: Italian');
-  console.log('  sv: Swedish');
-  console.log('  es: Spanish');
   console.log('  de: German');
+  console.log('  es: Spanish');
+  console.log('  it: Italian');
+  console.log('  nl: Dutch');
+  console.log('  pt: Portuguese');
   console.log('');
   console.log('Environments:');
   console.log('  Production: api-asr.voxist.com (default)');
@@ -44,7 +52,6 @@ if (args.length < 2) {
 const apiKey = args[0];
 const wavFilePath = args[1];
 const lang = args[2] || 'fr';
-const sampleRate = 16000;
 
 // Validate file exists
 if (!fs.existsSync(wavFilePath)) {
@@ -52,21 +59,31 @@ if (!fs.existsSync(wavFilePath)) {
   process.exit(1);
 }
 
-// Select the appropriate domain based on staging flag
-const domain = isStaging ? 'asr-staging-dev.voxist.com' : 'api-asr.voxist.com';
-const url = `wss://${domain}/ws?api_key=${apiKey}&lang=${lang}&sample_rate=${sampleRate}`;
+// Validate the audio up front. The gateway accepts any binary frame as PCM, so a
+// stereo / 8 kHz / MP3-in-a-.wav file produces a plausible-looking but wrong
+// transcript instead of an error.
+let wavInfo;
+try {
+  wavInfo = readWavInfo(wavFilePath);
+  assertStreamable(wavInfo, SAMPLE_RATE);
+} catch (error) {
+  console.error(`Error: ${error.message}`);
+  process.exit(1);
+}
 
-const BYTES_PER_SAMPLE = 2;
-const CHUNK_DURATION_MS = 100;
-const CHUNK_SIZE = Math.floor(
-  sampleRate * BYTES_PER_SAMPLE * (CHUNK_DURATION_MS / 1000),
-);
+// Select the appropriate domain based on staging flag.
+// VOXIST_ASR_URL overrides the base URL entirely (self-hosted gateway, local tests).
+const domain = isStaging ? 'asr-staging-dev.voxist.com' : 'api-asr.voxist.com';
+const baseUrl = process.env.VOXIST_ASR_URL || `wss://${domain}`;
+const url = `${baseUrl}/ws?api_key=${encodeURIComponent(apiKey)}&lang=${encodeURIComponent(
+  lang,
+)}&sample_rate=${SAMPLE_RATE}`;
 
 console.log(`Environment: ${isStaging ? 'Staging' : 'Production'}`);
-console.log(`Connecting to: ${url}`);
+console.log(`Connecting to: ${baseUrl}/ws?api_key=***&lang=${lang}&sample_rate=${SAMPLE_RATE}`);
 console.log(`Audio file: ${wavFilePath}`);
 console.log(`Language: ${lang}`);
-console.log(`Sample rate: ${sampleRate} Hz`);
+console.log(`Sample rate: ${SAMPLE_RATE} Hz`);
 console.log(`Chunk size: ${CHUNK_SIZE} bytes`);
 console.log('');
 
@@ -75,15 +92,24 @@ let start = Date.now();
 let first = true;
 let lastSegment = null;
 
-// Clear current line and move cursor to beginning
+// Clear current line and move cursor to beginning.
+// Guarded: these are TTY-only APIs and throw when stdout is a pipe or a file.
 const clearLine = () => {
-  process.stdout.clearLine(0);
-  process.stdout.cursorTo(0);
+  if (process.stdout.isTTY) {
+    process.stdout.clearLine(0);
+    process.stdout.cursorTo(0);
+  } else {
+    process.stdout.write('\n');
+  }
 };
 
 ws.on('open', async () => {
   console.log('Connected to WebSocket');
+
+  // Skip the WAV header — stream the `data` chunk only.
   const readStream = fs.createReadStream(wavFilePath, {
+    start: wavInfo.dataOffset,
+    end: wavInfo.dataOffset + wavInfo.dataSize - 1,
     highWaterMark: CHUNK_SIZE,
   });
   start = Date.now();
@@ -99,7 +125,11 @@ ws.on('open', async () => {
 
   readStream.on('end', () => {
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send('{"eof": 1}');
+      // End-of-stream signal. This MUST be the text frame `Done`: it is what
+      // flushes the decoder's tail and promotes the last partial to a final.
+      // The server then closes the socket once the engine has drained, so we
+      // wait for `close` rather than hanging up ourselves.
+      ws.send('Done');
     }
   });
 
@@ -140,7 +170,7 @@ ws.on('message', (data) => {
 
 ws.on('error', (error) => {
   console.error(`WebSocket error: ${error.message}`);
-  console.error(`Failed to connect to: ${url}`);
+  console.error(`Failed to connect to: ${baseUrl}/ws`);
   process.exit(1);
 });
 

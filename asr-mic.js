@@ -1,6 +1,9 @@
 import websocket from 'ws';
 import AudioRecorder from 'node-audiorecorder';
 
+// Only 16 kHz is served by the streaming engines. The gateway does not resample.
+const SAMPLE_RATE = 16000;
+
 // Parse command line arguments
 const args = process.argv.slice(2);
 const stagingIndex = args.indexOf('--staging');
@@ -24,13 +27,13 @@ if (args.length < 1) {
   console.log('Supported Languages:');
   console.log('  fr: French');
   console.log('  fr-medical: French Medical');
+  console.log('  fr-medicalV2-16 / fr-medicalV2-32 / fr-medicalV2-64: French Medical latency tiers');
   console.log('  en: English');
-  console.log('  pt: Portuguese');
-  console.log('  nl: Dutch');
-  console.log('  it: Italian');
-  console.log('  sv: Swedish');
-  console.log('  es: Spanish');
   console.log('  de: German');
+  console.log('  es: Spanish');
+  console.log('  it: Italian');
+  console.log('  nl: Dutch');
+  console.log('  pt: Portuguese');
   console.log('');
   console.log('Environments:');
   console.log('  Production: api-asr.voxist.com (default)');
@@ -44,14 +47,16 @@ if (args.length < 1) {
 
 const apiKey = args[0];
 const lang = args[1] || 'fr';
-const sampleRate = 16000;
 
 // Select the appropriate domain based on staging flag
 const domain = isStaging ? 'asr-staging-dev.voxist.com' : 'api-asr.voxist.com';
+// VOXIST_ASR_API_URL / VOXIST_ASR_URL override the HTTP and WebSocket base URLs
+// entirely (self-hosted gateway, local tests).
+const apiBaseUrl = process.env.VOXIST_ASR_API_URL || `https://${domain}`;
 
 console.log(`Environment: ${isStaging ? 'Staging' : 'Production'}`);
 console.log(`Language: ${lang}`);
-console.log(`Sample rate: ${sampleRate} Hz`);
+console.log(`Sample rate: ${SAMPLE_RATE} Hz`);
 console.log('Audio format: Mono 16-bit');
 console.log('');
 
@@ -59,13 +64,13 @@ console.log('');
 async function getWebSocketURL() {
   try {
     console.log('Requesting websocket URL with temporary token...');
-    
-    const response = await fetch(`https://${domain}/websocket?engine=voxist-rt-2`, {
+
+    const response = await fetch(`${apiBaseUrl}/websocket?engine=voxist-rt-2`, {
       method: 'GET',
       headers: {
-        'accept': 'application/json',
-        'X-LVL-KEY': apiKey
-      }
+        accept: 'application/json',
+        'X-LVL-KEY': apiKey,
+      },
     });
 
     if (!response.ok) {
@@ -73,18 +78,23 @@ async function getWebSocketURL() {
     }
 
     const data = await response.json();
-    
+
     if (!data.url) {
       throw new Error('No websocket URL received from server');
     }
 
-    // Add lang and sample_rate parameters to the websocket URL
+    // The returned URL carries only the token. Language and sample rate are
+    // per-connection parameters, so they are appended here.
     const wsUrl = new URL(data.url);
+    if (process.env.VOXIST_ASR_URL) {
+      const override = new URL(process.env.VOXIST_ASR_URL);
+      wsUrl.protocol = override.protocol;
+      wsUrl.host = override.host;
+    }
     wsUrl.searchParams.set('lang', lang);
-    wsUrl.searchParams.set('sample_rate', sampleRate.toString());
-    
+    wsUrl.searchParams.set('sample_rate', SAMPLE_RATE.toString());
+
     return wsUrl.toString();
-    
   } catch (error) {
     console.error(`Failed to get websocket URL: ${error.message}`);
     console.error('Make sure your API key is valid and you have the correct permissions');
@@ -92,21 +102,26 @@ async function getWebSocketURL() {
   }
 }
 
-// Configure audio recorder for mono 16-bit at specified sample rate
-const audioRecorder = new AudioRecorder({
-  program: 'sox',
-  device: null,
-  bits: 16,
-  channels: 1,
-  encoding: 'signed-integer',
-  format: 'wav',
-  rate: sampleRate,
-  type: 'wav',
-  silence: 0,
-  thresholdStart: 0.5,
-  thresholdStop: 0.5,
-  keepSilence: true
-}, console);
+// Configure audio recorder for mono 16-bit at the required sample rate.
+// `type: 'raw'` matters: the gateway forwards every binary frame to the decoder
+// as PCM, so a WAV-framed stream would feed it a 44-byte RIFF header as audio.
+const audioRecorder = new AudioRecorder(
+  {
+    program: 'sox',
+    device: null,
+    bits: 16,
+    channels: 1,
+    encoding: 'signed-integer',
+    format: 'S16_LE',
+    rate: SAMPLE_RATE,
+    type: 'raw',
+    silence: 0,
+    thresholdStart: 0.5,
+    thresholdStop: 0.5,
+    keepSilence: true,
+  },
+  console,
+);
 
 let ws;
 let start = Date.now();
@@ -114,10 +129,15 @@ let first = true;
 let lastSegment = null;
 let recording = false;
 
-// Clear current line and move cursor to beginning
+// Clear current line and move cursor to beginning.
+// Guarded: these are TTY-only APIs and throw when stdout is a pipe or a file.
 const clearLine = () => {
-  process.stdout.clearLine(0);
-  process.stdout.cursorTo(0);
+  if (process.stdout.isTTY) {
+    process.stdout.clearLine(0);
+    process.stdout.cursorTo(0);
+  } else {
+    process.stdout.write('\n');
+  }
 };
 
 // Main function to start the microphone transcription
@@ -125,40 +145,44 @@ async function startTranscription() {
   try {
     // Get the websocket URL with temporary token
     const wsUrl = await getWebSocketURL();
-    console.log(`Connecting to: ${wsUrl}`);
-    
+    const redacted = new URL(wsUrl);
+    console.log(
+      `Connecting to: ${redacted.origin}${redacted.pathname}?token=***&lang=${lang}&sample_rate=${SAMPLE_RATE}`,
+    );
+
     // Create websocket connection
     ws = new websocket(wsUrl);
-    
+
     ws.on('open', () => {
       console.log('Connected to WebSocket');
       console.log('Starting microphone recording...');
       console.log('Press Ctrl+C to stop recording and disconnect');
       console.log('');
-      
+
       try {
         const readStream = audioRecorder.start().stream();
         start = Date.now();
         recording = true;
-        
+
         readStream.on('data', (chunk) => {
           if (ws.readyState === websocket.OPEN) {
             ws.send(chunk);
           }
         });
-        
+
         readStream.on('end', () => {
           console.log('\nMicrophone recording ended');
           if (ws.readyState === websocket.OPEN) {
-            ws.send('{"eof": 1}');
+            // End-of-stream signal: the text frame `Done` flushes the decoder's
+            // tail and promotes the last partial to a final.
+            ws.send('Done');
           }
         });
-        
+
         readStream.on('error', (error) => {
           console.error(`Microphone error: ${error.message}`);
           cleanup();
         });
-        
       } catch (error) {
         console.error(`Failed to start microphone: ${error.message}`);
         console.error('Make sure SoX is installed and your microphone is available');
@@ -208,7 +232,6 @@ async function startTranscription() {
       }
       cleanup();
     });
-    
   } catch (error) {
     console.error(`Error starting transcription: ${error.message}`);
     process.exit(1);
@@ -233,8 +256,18 @@ function cleanup() {
 process.on('SIGINT', () => {
   console.log('\nReceived SIGINT, shutting down gracefully...');
   if (ws && ws.readyState === websocket.OPEN) {
-    ws.send('{"eof": 1}');
-    ws.close();
+    // Stop the microphone first, then flush with `Done` and let the server close
+    // the socket once the engine has drained the tail.
+    if (recording) {
+      try {
+        audioRecorder.stop();
+        recording = false;
+      } catch (error) {
+        console.error(`Error stopping recorder: ${error.message}`);
+      }
+    }
+    ws.send('Done');
+    setTimeout(cleanup, 2000).unref();
   } else {
     cleanup();
   }
