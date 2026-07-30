@@ -19,8 +19,21 @@ if (isStaging) {
   args.splice(stagingIndex, 1);
 }
 
+// Optional --punctuation-mode=Generated|Dictated
+let punctuationMode = null;
+const pmIndex = args.findIndex((a) => a.startsWith('--punctuation-mode'));
+if (pmIndex !== -1) {
+  const inline = args[pmIndex].split('=')[1];
+  punctuationMode = inline || args[pmIndex + 1];
+  args.splice(pmIndex, inline ? 1 : 2);
+  if (!['Generated', 'Dictated'].includes(punctuationMode)) {
+    console.error(`Error: --punctuation-mode must be Generated or Dictated (got "${punctuationMode}")`);
+    process.exit(1);
+  }
+}
+
 if (args.length < 2) {
-  console.log('Usage: node asr-file-ws.js <API_KEY> <WAV_FILE> [LANG] [--staging]');
+  console.log('Usage: node asr-file-ws.js <API_KEY> <WAV_FILE> [LANG] [--punctuation-mode=MODE] [--staging]');
   console.log('Example: node asr-file-ws.js your-api-key audio.wav fr');
   console.log('Example: node asr-file-ws.js your-staging-api-key audio.wav fr-medical --staging');
   console.log('');
@@ -28,6 +41,7 @@ if (args.length < 2) {
   console.log('  API_KEY: Your Voxist API key');
   console.log('  WAV_FILE: Path to the WAV audio file (16 kHz mono 16-bit PCM)');
   console.log('  LANG: Language code (optional, default: "fr")');
+  console.log('  --punctuation-mode: Generated (default) or Dictated, for spoken punctuation');
   console.log('  --staging: Use staging environment (optional)');
   console.log('');
   console.log('Supported Languages:');
@@ -77,12 +91,13 @@ const domain = isStaging ? 'asr-staging-dev.voxist.com' : 'api-asr.voxist.com';
 const baseUrl = process.env.VOXIST_ASR_URL || `wss://${domain}`;
 const url = `${baseUrl}/ws?api_key=${encodeURIComponent(apiKey)}&lang=${encodeURIComponent(
   lang,
-)}&sample_rate=${SAMPLE_RATE}`;
+)}&sample_rate=${SAMPLE_RATE}${punctuationMode ? `&punctuation_mode=${punctuationMode}` : ''}`;
 
 console.log(`Environment: ${isStaging ? 'Staging' : 'Production'}`);
 console.log(`Connecting to: ${baseUrl}/ws?api_key=***&lang=${lang}&sample_rate=${SAMPLE_RATE}`);
 console.log(`Audio file: ${wavFilePath}`);
 console.log(`Language: ${lang}`);
+console.log(`Punctuation mode: ${punctuationMode || 'Generated (default)'}`);
 console.log(`Sample rate: ${SAMPLE_RATE} Hz`);
 console.log(`Chunk size: ${CHUNK_SIZE} bytes`);
 console.log('');

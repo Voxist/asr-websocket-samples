@@ -21,12 +21,13 @@ CHUNK_DURATION_MS = 100
 
 
 class ASRWebSocketClient:
-    def __init__(self, wav_file_path, api_key, lang="fr", is_staging=False):
+    def __init__(self, wav_file_path, api_key, lang="fr", is_staging=False, punctuation_mode=None):
         self.wav_file_path = Path(wav_file_path)
         self.api_key = api_key
         self.lang = lang
         self.sample_rate = SAMPLE_RATE
         self.is_staging = is_staging
+        self.punctuation_mode = punctuation_mode
 
         # Select the appropriate domain based on staging flag.
         # VOXIST_ASR_URL overrides the base URL entirely (self-hosted gateway, local tests).
@@ -36,6 +37,8 @@ class ASRWebSocketClient:
             f"{self.base_url}/ws"
             f"?api_key={quote(api_key)}&lang={quote(lang)}&sample_rate={self.sample_rate}"
         )
+        if punctuation_mode:
+            self.url += f"&punctuation_mode={quote(punctuation_mode)}"
 
         self.CHUNK_SIZE = int(self.sample_rate * BYTES_PER_SAMPLE * (CHUNK_DURATION_MS / 1000))
 
@@ -136,6 +139,7 @@ class ASRWebSocketClient:
         print(f"Connecting to: {self.base_url}/ws?api_key=***&lang={self.lang}&sample_rate={self.sample_rate}")
         print(f"Audio file: {self.wav_file_path}")
         print(f"Language: {self.lang}")
+        print(f"Punctuation mode: {self.punctuation_mode or 'Generated (default)'}")
         print(f"Sample rate: {self.sample_rate} Hz")
         print(f"Chunk size: {self.CHUNK_SIZE} bytes")
         print('')
@@ -172,8 +176,23 @@ def main():
     if is_staging:
         args.remove('--staging')
 
+    # Optional --punctuation-mode=Generated|Dictated
+    punctuation_mode = None
+    for i, arg in enumerate(list(args)):
+        if arg.startswith('--punctuation-mode'):
+            if '=' in arg:
+                punctuation_mode = arg.split('=', 1)[1]
+                args.pop(i)
+            else:
+                punctuation_mode = args[i + 1] if i + 1 < len(args) else None
+                del args[i:i + 2]
+            if punctuation_mode not in ('Generated', 'Dictated'):
+                print(f"Error: --punctuation-mode must be Generated or Dictated (got '{punctuation_mode}')")
+                sys.exit(1)
+            break
+
     if len(args) < 2:
-        print("Usage: python asr-file-ws.py <API_KEY> <WAV_FILE> [LANG] [--staging]")
+        print("Usage: python asr-file-ws.py <API_KEY> <WAV_FILE> [LANG] [--punctuation-mode=MODE] [--staging]")
         print("Example: python asr-file-ws.py your-api-key audio.wav fr")
         print("Example: python asr-file-ws.py your-staging-api-key audio.wav fr-medical --staging")
         print("")
@@ -181,6 +200,7 @@ def main():
         print("  API_KEY: Your Voxist API key")
         print("  WAV_FILE: Path to the WAV audio file (16 kHz mono 16-bit PCM)")
         print("  LANG: Language code (optional, default: 'fr')")
+        print("  --punctuation-mode: Generated (default) or Dictated, for spoken punctuation")
         print("  --staging: Use staging environment (optional)")
         print("")
         print("Supported Languages:")
@@ -205,7 +225,7 @@ def main():
     wav_file = args[1]
     lang = args[2] if len(args) > 2 else "fr"
 
-    client = ASRWebSocketClient(wav_file, api_key, lang, is_staging)
+    client = ASRWebSocketClient(wav_file, api_key, lang, is_staging, punctuation_mode)
 
     try:
         client.validate_audio()

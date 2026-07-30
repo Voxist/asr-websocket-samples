@@ -14,14 +14,28 @@ if (isStaging) {
   args.splice(stagingIndex, 1);
 }
 
+// Optional --punctuation-mode=Generated|Dictated
+let punctuationMode = null;
+const pmIndex = args.findIndex((a) => a.startsWith('--punctuation-mode'));
+if (pmIndex !== -1) {
+  const inline = args[pmIndex].split('=')[1];
+  punctuationMode = inline || args[pmIndex + 1];
+  args.splice(pmIndex, inline ? 1 : 2);
+  if (!['Generated', 'Dictated'].includes(punctuationMode)) {
+    console.error(`Error: --punctuation-mode must be Generated or Dictated (got "${punctuationMode}")`);
+    process.exit(1);
+  }
+}
+
 if (args.length < 1) {
-  console.log('Usage: node asr-mic.js <API_KEY> [LANG] [--staging]');
+  console.log('Usage: node asr-mic.js <API_KEY> [LANG] [--punctuation-mode=MODE] [--staging]');
   console.log('Example: node asr-mic.js your-api-key fr');
   console.log('Example: node asr-mic.js your-staging-api-key fr-medical --staging');
   console.log('');
   console.log('Parameters:');
   console.log('  API_KEY: Your Voxist API key');
   console.log('  LANG: Language code (optional, default: "fr")');
+  console.log('  --punctuation-mode: Generated (default) or Dictated, for spoken punctuation');
   console.log('  --staging: Use staging environment (optional)');
   console.log('');
   console.log('Supported Languages:');
@@ -56,6 +70,7 @@ const apiBaseUrl = process.env.VOXIST_ASR_API_URL || `https://${domain}`;
 
 console.log(`Environment: ${isStaging ? 'Staging' : 'Production'}`);
 console.log(`Language: ${lang}`);
+console.log(`Punctuation mode: ${punctuationMode || 'Generated (default)'}`);
 console.log(`Sample rate: ${SAMPLE_RATE} Hz`);
 console.log('Audio format: Mono 16-bit');
 console.log('');
@@ -93,6 +108,9 @@ async function getWebSocketURL() {
     }
     wsUrl.searchParams.set('lang', lang);
     wsUrl.searchParams.set('sample_rate', SAMPLE_RATE.toString());
+    if (punctuationMode) {
+      wsUrl.searchParams.set('punctuation_mode', punctuationMode);
+    }
 
     return wsUrl.toString();
   } catch (error) {

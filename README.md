@@ -59,7 +59,7 @@ token is short-lived (1 hour) and does not expose your long-lived API key.
 | `api_key` or `token` | yes | Authentication. Exactly one of the two. |
 | `lang` | no | Language / model. If omitted, the connection waits for a `config` message before it accepts audio — any audio sent before then is **discarded**. |
 | `sample_rate` | no | Defaults to `16000`. See the note under [Audio Format](#audio-format). |
-| `punctuation_mode` | no | `Generated` (default) or `Dictated`. Only takes effect for accounts with V2 text processing enabled — otherwise accepted and ignored. |
+| `punctuation_mode` | no | `Generated` (default) or `Dictated`. See [Punctuation modes](#punctuation-modes). |
 
 ### Audio Format
 
@@ -123,6 +123,48 @@ This is also how you change settings on a live connection. Changing `lang`
 transparently reconnects the session to the new engine — you do not need to open
 a new socket. If you connected without a `lang` URL parameter, this message is
 what unblocks audio processing.
+
+### Punctuation modes
+
+Transcripts are post-processed server-side before they reach you. Two modes are
+available, on every language:
+
+- **`Generated`** (default) — the pipeline inserts punctuation and casing for you.
+- **`Dictated`** — spoken punctuation commands ("point", "virgule", "à la ligne")
+  are converted into the corresponding marks instead of being transcribed as
+  words. This is the mode to use for dictation workflows.
+
+Set it in the URL (`&punctuation_mode=Dictated`) or in a `config` message, and
+change it mid-session with another `config` message:
+
+```json
+{ "config": { "punctuation_mode": "Dictated" } }
+```
+
+The same pipeline applies number formatting, and on the medical models, unit
+normalization.
+
+### Custom vocabulary
+
+Per-session term replacements are applied at the end of the text pipeline — use
+them for names, local jargon, or product terms the model spells differently:
+
+```json
+{
+  "config": {
+    "user_vocabulary": [
+      { "pattern": "petite soeur", "replacement": "MySys", "case_sensitive": false }
+    ]
+  }
+}
+```
+
+- Literal matching only — a `pattern` is not a regular expression, and entries
+  flagged `is_regex` are dropped.
+- Up to **100 entries**; `pattern` and `replacement` are capped at **256 bytes** each.
+- Re-send at any point to replace the whole set; send an empty array to clear it.
+- Invalid entries are dropped individually rather than voiding the whole set,
+  and dropping is silent — there is no per-entry error response.
 
 ### End of Transcription
 
@@ -334,7 +376,7 @@ npm install
 Direct WebSocket connection using API key authentication with CLI parameters:
 
 ```bash
-node asr-file-ws.js <API_KEY> <WAV_FILE> [LANG] [--staging]
+node asr-file-ws.js <API_KEY> <WAV_FILE> [LANG] [--punctuation-mode=MODE] [--staging]
 ```
 
 **Examples:**
@@ -347,6 +389,9 @@ node asr-file-ws.js your-staging-api-key audio.wav fr-medical --staging
 
 # English transcription in production
 node asr-file-ws.js your-prod-api-key audio.wav en
+
+# Dictation mode: spoken punctuation becomes real punctuation
+node asr-file-ws.js your-prod-api-key audio.wav fr-medical --punctuation-mode=Dictated
 ```
 
 **Parameters:**
@@ -354,6 +399,7 @@ node asr-file-ws.js your-prod-api-key audio.wav en
 - `WAV_FILE`: Path to the WAV audio file (16 kHz mono 16-bit PCM; the script
   validates this and strips the WAV header before streaming)
 - `LANG`: Language code (optional, default: `fr`)
+- `--punctuation-mode`: `Generated` (default) or `Dictated` — see [Punctuation modes](#punctuation-modes)
 - `--staging`: Use staging environment (optional)
 
 ### asr-mic.js (Real-time Microphone Transcription)
@@ -361,7 +407,7 @@ node asr-file-ws.js your-prod-api-key audio.wav en
 Real-time microphone transcription using WebSocket with temporary token authentication:
 
 ```bash
-node asr-mic.js <API_KEY> [LANG] [--staging]
+node asr-mic.js <API_KEY> [LANG] [--punctuation-mode=MODE] [--staging]
 ```
 
 **Examples:**
@@ -379,6 +425,7 @@ node asr-mic.js your-prod-api-key en
 **Parameters:**
 - `API_KEY`: Your Voxist API key (different for staging and production)
 - `LANG`: Language code (optional, default: `fr`)
+- `--punctuation-mode`: `Generated` (default) or `Dictated` — see [Punctuation modes](#punctuation-modes)
 - `--staging`: Use staging environment (optional)
 
 **Features:**
@@ -434,7 +481,7 @@ pip install -r requirements.txt
 #### asr-file-ws.py (Direct WebSocket with API Key)
 
 ```bash
-python asr-file-ws.py <API_KEY> <WAV_FILE> [LANG] [--staging]
+python asr-file-ws.py <API_KEY> <WAV_FILE> [LANG] [--punctuation-mode=MODE] [--staging]
 ```
 
 **Examples:**
@@ -447,6 +494,9 @@ python asr-file-ws.py your-staging-api-key audio.wav fr-medical --staging
 
 # English transcription in production
 python asr-file-ws.py your-prod-api-key audio.wav en
+
+# Dictation mode: spoken punctuation becomes real punctuation
+python asr-file-ws.py your-prod-api-key audio.wav fr-medical --punctuation-mode=Dictated
 ```
 
 ## Pointing the samples at another gateway
