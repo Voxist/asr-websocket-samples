@@ -65,9 +65,13 @@ token is short-lived (1 hour) and does not expose your long-lived API key.
 
 Send raw audio data directly to the WebSocket:
 
-- **Format**: Raw PCM audio bytes — **not** a WAV file. Strip the 44-byte RIFF
-  header; the server forwards every binary frame straight to the decoder, so a
-  header sent on the wire is decoded as if it were audio.
+- **Format**: Raw PCM audio bytes — **not** a WAV file. Locate the `data` chunk
+  and send its contents only; the server forwards every binary frame straight to
+  the decoder, so header bytes on the wire are decoded as if they were audio.
+  Do **not** assume a fixed 44-byte header: a `LIST`/`INFO` chunk (what ffmpeg
+  writes by default, and what most DAW exports carry) pushes `data` further in,
+  and skipping a fixed 44 bytes then misaligns every sample. `wav.js` / `wav.py`
+  in this repo walk the chunk list for exactly this reason.
 - **Encoding**: Signed 16-bit little-endian
 - **Channels**: Mono (1 channel)
 - **Sample Rate**: 16000 Hz
@@ -293,7 +297,10 @@ The WebSocket returns JSON messages with transcription results. Both partial and
 #### Response Fields
 
 - **`text`**: The transcribed text
-- **`transcript`**: Same value as `text`, for compatibility with older clients
+- **`transcript`**: Best-effort mirror of `text`, added by the server-side text
+  pipeline. It is absent when that pipeline passes a message through untouched
+  (empty text, or an internal processing error), so **read `text`** and treat
+  `transcript` as optional
 - **`type`**: `"partial"` for real-time updates, `"final"` for completed segments
 - **`startedAt`**: Start time of the segment in seconds
 - **`segment`**: Segment number (increments for each completed phrase/sentence)
@@ -301,7 +308,8 @@ The WebSocket returns JSON messages with transcription results. Both partial and
   - **`segments`**: Array of text segments with timing
   - **`words`**: Array of individual words with precise timestamps
 
-**Note**: The only difference between partial and final results is the `type` field. Partial results may have incomplete words (e.g., "te" instead of "test"), while final results contain the complete, corrected transcription.
+**Note**: Read `text`, not `transcript` — see the field list above. The only
+difference between partial and final results is the `type` field. Partial results may have incomplete words (e.g., "te" instead of "test"), while final results contain the complete, corrected transcription.
 
 Word-level timings inside `elements` are produced by the acoustic model and are
 not re-aligned after text post-processing, so on medical models the `text` may
@@ -328,6 +336,9 @@ Failures arrive as WebSocket close codes, not as JSON error messages:
 | `1011` | Engine unavailable, engine timeout, or a language with no engine configured in this environment | Retry; escalate if persistent |
 | `1013` | Server at capacity. The close reason carries `{"error":"server_overloaded","retryAfterMs":3000}` | Back off and retry after the advertised delay |
 | `1006` (no handshake) | Rejected during the HTTP upgrade — bad or missing credentials | Check the API key / token and the target environment |
+
+All three scripts exit non-zero and print the code and reason on an abnormal
+close, so a wrapper script can tell a capacity rejection from a clean run.
 
 Other things to watch for:
 

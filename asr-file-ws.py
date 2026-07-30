@@ -4,14 +4,16 @@ Python WebSocket client for Voxist ASR streaming
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import sys
 import time
-import wave
 import websockets
 from pathlib import Path
 from urllib.parse import quote
+
+from wav import WavError, assert_streamable, read_wav_info
 
 # Only 16 kHz is served by the streaming engines. The gateway does not resample,
 # so this is not a knob - it is a property of the audio you must supply.
@@ -28,6 +30,7 @@ class ASRWebSocketClient:
         self.sample_rate = SAMPLE_RATE
         self.is_staging = is_staging
         self.punctuation_mode = punctuation_mode
+        self.wav_info = None
 
         # Select the appropriate domain based on staging flag.
         # VOXIST_ASR_URL overrides the base URL entirely (self-hosted gateway, local tests).
@@ -52,56 +55,46 @@ class ASRWebSocketClient:
         print('\r' + ' ' * 80 + '\r', end='', flush=True)
 
     def validate_audio(self):
-        """Reject anything the gateway would silently mis-transcribe.
+        """Parse the container and reject audio the gateway would mis-transcribe.
 
         The gateway treats every binary frame as raw PCM: it does not resample,
         does not downmix, and does not inspect the WAV header. Sending 8 kHz or
         stereo audio therefore yields a wrong transcript rather than an error.
         """
-        with wave.open(str(self.wav_file_path), 'rb') as wav:
-            problems = []
-            if wav.getnchannels() != 1:
-                problems.append(f"{wav.getnchannels()} channels, expected mono")
-            if wav.getsampwidth() != BYTES_PER_SAMPLE:
-                problems.append(f"{wav.getsampwidth() * 8}-bit, expected 16-bit")
-            if wav.getframerate() != self.sample_rate:
-                problems.append(f"{wav.getframerate()} Hz, expected {self.sample_rate} Hz")
-
-            if problems:
-                raise ValueError(
-                    "Unsupported audio: " + ", ".join(problems) + ".\n"
-                    "Convert it first:\n"
-                    f"  ffmpeg -i input.wav -ac 1 -ar {self.sample_rate} -sample_fmt s16 output.wav"
-                )
+        self.wav_info = read_wav_info(str(self.wav_file_path))
+        assert_streamable(self.wav_info, self.sample_rate)
 
     async def send_audio_chunks(self, websocket):
-        """Read and send audio frames in chunks"""
+        """Stream the `data` chunk in real-time-sized pieces.
+
+        Reads by offset rather than through the stdlib `wave` module so the
+        header never reaches the socket and a pipe-written file (declared data
+        length 0) still streams the audio it actually contains.
+        """
         self.start_time = time.time()
 
         try:
-            # wave.readframes() yields the `data` chunk only - the 44-byte header
-            # never reaches the socket, where it would be decoded as audio.
-            with wave.open(str(self.wav_file_path), 'rb') as wav:
-                frames_per_chunk = self.CHUNK_SIZE // BYTES_PER_SAMPLE
-                while True:
-                    chunk = wav.readframes(frames_per_chunk)
+            with open(self.wav_file_path, 'rb') as f:
+                f.seek(self.wav_info.data_offset)
+                remaining = self.wav_info.data_size
+                while remaining > 0:
+                    chunk = f.read(min(self.CHUNK_SIZE, remaining))
                     if not chunk:
                         break
+                    remaining -= len(chunk)
 
                     await websocket.send(chunk)
                     await asyncio.sleep(CHUNK_DURATION_MS / 1000)
-
-            # End-of-stream signal. This MUST be the text frame `Done`: it is
-            # what flushes the decoder's tail and promotes the last partial to a
-            # final. The server closes the socket once the engine has drained.
-            await websocket.send('Done')
-
-        except FileNotFoundError:
-            print(f"Error: Could not find audio file at {self.wav_file_path}")
-            return
-        except Exception as e:
+        except OSError as e:
+            # File-read failures only. A ConnectionClosed raised by send() must
+            # propagate: it carries the close code the caller reports.
             print(f"Error reading audio file: {e}")
             return
+
+        # End-of-stream signal. This MUST be the text frame `Done`: it is what
+        # flushes the decoder's tail and promotes the last partial to a final.
+        # The server closes the socket once the engine has drained.
+        await websocket.send('Done')
 
     def handle_message(self, message_data):
         """Handle incoming WebSocket messages"""
@@ -133,8 +126,33 @@ class ASRWebSocketClient:
         except Exception as e:
             print(f"Error handling message: {e}")
 
+    def report_close(self, exc):
+        """Explain an abnormal close using the gateway's documented codes."""
+        code = getattr(exc, 'code', None)
+        reason = (getattr(exc, 'reason', '') or '').strip()
+
+        detail = reason
+        if reason.startswith('{'):
+            try:
+                payload = json.loads(reason)
+                detail = payload.get('message', reason)
+                if payload.get('retryAfterMs'):
+                    detail += f" (retry after {payload['retryAfterMs']} ms)"
+            except json.JSONDecodeError:
+                pass
+
+        explanations = {
+            1008: 'Unsupported language code, or a model this account is not entitled to',
+            1011: 'ASR engine unavailable, timed out, or not configured for this language',
+            1013: 'Server at capacity - back off and retry',
+        }
+        print(f"\nConnection closed by server: code {code}"
+              f"{' - ' + detail if detail else ''}")
+        if code in explanations:
+            print(f"  {explanations[code]}")
+
     async def run(self):
-        """Run the WebSocket client"""
+        """Run the WebSocket client. Returns a process exit status."""
         print(f"Environment: {'Staging' if self.is_staging else 'Production'}")
         print(f"Connecting to: {self.base_url}/ws?api_key=***&lang={self.lang}&sample_rate={self.sample_rate}")
         print(f"Audio file: {self.wav_file_path}")
@@ -144,6 +162,9 @@ class ASRWebSocketClient:
         print(f"Chunk size: {self.CHUNK_SIZE} bytes")
         print('')
 
+        exit_code = 0
+        send_task = None
+
         try:
             async with websockets.connect(self.url) as websocket:
                 print('Connected to WebSocket')
@@ -151,20 +172,35 @@ class ASRWebSocketClient:
                 # Start sending audio chunks
                 send_task = asyncio.create_task(self.send_audio_chunks(websocket))
 
-                # Listen for messages
+                # Listen for messages until the server closes the connection,
+                # which it does once the engine has drained the tail.
                 async for message in websocket:
                     self.handle_message(message)
 
                 await send_task
 
-        except websockets.exceptions.ConnectionClosed:
-            # The server closes the socket itself once the engine has drained.
+        except websockets.exceptions.ConnectionClosedOK:
             pass
+        except websockets.exceptions.ConnectionClosed as e:
+            # 1008 / 1011 / 1013 land here. Surfacing the code matters: without
+            # it a capacity rejection is indistinguishable from a clean run.
+            self.report_close(e)
+            exit_code = 1
+        except OSError as e:
+            print(f"Connection error: {e}")
+            exit_code = 1
         except Exception as e:
             print(f"WebSocket error: {e}")
+            exit_code = 1
         finally:
+            if send_task is not None and not send_task.done():
+                send_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await send_task
             elapsed = int((time.time() - self.start_time) * 1000) if self.start_time else 0
             print(f'\nFinished: {elapsed} ms')
+
+        return exit_code
 
 
 def main():
@@ -232,11 +268,11 @@ def main():
     except FileNotFoundError:
         print(f"Error: Could not find audio file at {wav_file}")
         sys.exit(1)
-    except (ValueError, wave.Error) as e:
+    except (WavError, OSError) as e:
         print(f"Error: {e}")
         sys.exit(1)
 
-    asyncio.run(client.run())
+    sys.exit(asyncio.run(client.run()))
 
 
 if __name__ == "__main__":

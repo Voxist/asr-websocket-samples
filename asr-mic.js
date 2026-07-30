@@ -141,11 +141,65 @@ const audioRecorder = new AudioRecorder(
   console,
 );
 
+
+// The gateway reports failures as close codes, not as JSON error messages.
+const CLOSE_EXPLANATIONS = {
+  1008: 'Unsupported language code, or a model this account is not entitled to',
+  1011: 'ASR engine unavailable, timed out, or not configured for this language',
+  1013: 'Server at capacity - back off and retry',
+};
+
+function describeClose(code, reason) {
+  let detail = reason ? reason.toString() : '';
+  if (detail.startsWith('{')) {
+    try {
+      const payload = JSON.parse(detail);
+      detail = payload.message || detail;
+      if (payload.retryAfterMs) detail += ` (retry after ${payload.retryAfterMs} ms)`;
+    } catch {
+      /* not JSON */
+    }
+  }
+  console.log(`Connection closed by server: code ${code}${detail ? ' - ' + detail : ''}`);
+  if (CLOSE_EXPLANATIONS[code]) console.log(`  ${CLOSE_EXPLANATIONS[code]}`);
+}
+
 let ws;
 let start = Date.now();
 let first = true;
 let lastSegment = null;
 let recording = false;
+let doneSent = false;
+let shuttingDown = false;
+let drainTimer = null;
+let flushTimer = null;
+
+// How long to wait for the engine's tail after `Done` before giving up. The
+// server normally closes first; this is only a backstop against a hung session.
+const DRAIN_TIMEOUT_MS = 15000;
+// Backstop for the recorder's stream never emitting `end` after being killed.
+const FLUSH_TIMEOUT_MS = 1000;
+
+// The gateway matches on `text.includes('Done')` and, per `Done`, emits a usage
+// analytics event and forwards another flush upstream — so it must be sent
+// exactly once per session.
+function sendDone() {
+  if (doneSent) return;
+  doneSent = true;
+  if (ws && ws.readyState === websocket.OPEN) {
+    ws.send('Done');
+  }
+}
+
+function stopRecording() {
+  if (!recording) return;
+  recording = false;
+  try {
+    audioRecorder.stop();
+  } catch (error) {
+    console.error(`Error stopping recorder: ${error.message}`);
+  }
+}
 
 // Clear current line and move cursor to beginning.
 // Guarded: these are TTY-only APIs and throw when stdout is a pipe or a file.
@@ -190,16 +244,17 @@ async function startTranscription() {
 
         readStream.on('end', () => {
           console.log('\nMicrophone recording ended');
-          if (ws.readyState === websocket.OPEN) {
-            // End-of-stream signal: the text frame `Done` flushes the decoder's
-            // tail and promotes the last partial to a final.
-            ws.send('Done');
-          }
+          // End-of-stream signal: the text frame `Done` flushes the decoder's
+          // tail and promotes the last partial to a final. Killing sox does not
+          // drain its stdout synchronously, so waiting for `end` is what keeps
+          // the last buffered audio ahead of the flush.
+          if (flushTimer) clearTimeout(flushTimer);
+          sendDone();
         });
 
         readStream.on('error', (error) => {
           console.error(`Microphone error: ${error.message}`);
-          cleanup();
+          cleanup(1);
         });
       } catch (error) {
         console.error(`Failed to start microphone: ${error.message}`);
@@ -239,16 +294,18 @@ async function startTranscription() {
 
     ws.on('error', (error) => {
       console.error(`WebSocket error: ${error.message}`);
-      cleanup();
+      cleanup(1);
     });
 
     ws.on('close', (code, reason) => {
       console.log('\nWebSocket connection closed');
       console.log('Total session time: ' + (Date.now() - start) + ' ms');
-      if (code !== 1000) {
-        console.log(`Close code: ${code}, reason: ${reason}`);
+      if (code === 1000) {
+        cleanup(0);
+        return;
       }
-      cleanup();
+      describeClose(code, reason);
+      cleanup(1);
     });
   } catch (error) {
     console.error(`Error starting transcription: ${error.message}`);
@@ -257,43 +314,58 @@ async function startTranscription() {
 }
 
 // Cleanup function
-function cleanup() {
+function cleanup(exitCode = 0) {
+  if (drainTimer) clearTimeout(drainTimer);
+  if (flushTimer) clearTimeout(flushTimer);
   if (recording) {
     console.log('\nStopping microphone recording...');
-    try {
-      audioRecorder.stop();
-      recording = false;
-    } catch (error) {
-      console.error(`Error stopping recorder: ${error.message}`);
-    }
+    stopRecording();
   }
-  process.exit();
+  process.exit(exitCode);
 }
 
 // Handle graceful shutdown
 process.on('SIGINT', () => {
-  console.log('\nReceived SIGINT, shutting down gracefully...');
-  if (ws && ws.readyState === websocket.OPEN) {
-    // Stop the microphone first, then flush with `Done` and let the server close
-    // the socket once the engine has drained the tail.
-    if (recording) {
-      try {
-        audioRecorder.stop();
-        recording = false;
-      } catch (error) {
-        console.error(`Error stopping recorder: ${error.message}`);
-      }
-    }
-    ws.send('Done');
-    setTimeout(cleanup, 2000).unref();
-  } else {
-    cleanup();
+  // A second Ctrl+C abandons the drain instead of waiting it out.
+  if (shuttingDown) {
+    console.log('\nSecond interrupt - exiting without waiting for the final result');
+    cleanup(130);
+    return;
   }
+  shuttingDown = true;
+  console.log('\nReceived SIGINT, shutting down gracefully...');
+
+  if (!ws || ws.readyState !== websocket.OPEN) {
+    cleanup(130);
+    return;
+  }
+
+  // Stop the microphone and let the stream's `end` event send `Done`, so any
+  // audio still buffered in sox's stdout reaches the engine before the flush.
+  stopRecording();
+  flushTimer = setTimeout(sendDone, FLUSH_TIMEOUT_MS);
+
+  // Then wait for the server to close: that is what guarantees the last `final`
+  // has been delivered. Close cleanly ourselves only if it never arrives.
+  console.log('Waiting for the final transcription result...');
+  drainTimer = setTimeout(() => {
+    console.log(`No close from server after ${DRAIN_TIMEOUT_MS} ms - closing`);
+    if (ws.readyState === websocket.OPEN) {
+      ws.close(1000, 'Client drain timeout');
+    } else {
+      cleanup(0);
+    }
+  }, DRAIN_TIMEOUT_MS);
 });
 
 process.on('SIGTERM', () => {
-  console.log('\nReceived SIGTERM, shutting down gracefully...');
-  cleanup();
+  console.log('\nReceived SIGTERM, shutting down...');
+  stopRecording();
+  if (ws && ws.readyState === websocket.OPEN) {
+    sendDone();
+    ws.close(1000, 'Client terminated');
+  }
+  cleanup(143);
 });
 
 // Start the transcription

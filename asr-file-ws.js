@@ -102,6 +102,29 @@ console.log(`Sample rate: ${SAMPLE_RATE} Hz`);
 console.log(`Chunk size: ${CHUNK_SIZE} bytes`);
 console.log('');
 
+
+// The gateway reports failures as close codes, not as JSON error messages.
+const CLOSE_EXPLANATIONS = {
+  1008: 'Unsupported language code, or a model this account is not entitled to',
+  1011: 'ASR engine unavailable, timed out, or not configured for this language',
+  1013: 'Server at capacity - back off and retry',
+};
+
+function describeClose(code, reason) {
+  let detail = reason ? reason.toString() : '';
+  if (detail.startsWith('{')) {
+    try {
+      const payload = JSON.parse(detail);
+      detail = payload.message || detail;
+      if (payload.retryAfterMs) detail += ` (retry after ${payload.retryAfterMs} ms)`;
+    } catch {
+      /* not JSON */
+    }
+  }
+  console.log(`Connection closed by server: code ${code}${detail ? ' - ' + detail : ''}`);
+  if (CLOSE_EXPLANATIONS[code]) console.log(`  ${CLOSE_EXPLANATIONS[code]}`);
+}
+
 const ws = new WebSocket(url);
 let start = Date.now();
 let first = true;
@@ -121,12 +144,21 @@ const clearLine = () => {
 ws.on('open', async () => {
   console.log('Connected to WebSocket');
 
-  // Skip the WAV header — stream the `data` chunk only.
-  const readStream = fs.createReadStream(wavFilePath, {
-    start: wavInfo.dataOffset,
-    end: wavInfo.dataOffset + wavInfo.dataSize - 1,
-    highWaterMark: CHUNK_SIZE,
-  });
+  // Skip the WAV header — stream the `data` chunk only. readWavInfo guarantees
+  // dataSize > 0, so the range below is always valid; the guard keeps any
+  // surprise from becoming an unhandled rejection inside this async handler.
+  let readStream;
+  try {
+    readStream = fs.createReadStream(wavFilePath, {
+      start: wavInfo.dataOffset,
+      end: wavInfo.dataOffset + wavInfo.dataSize - 1,
+      highWaterMark: CHUNK_SIZE,
+    });
+  } catch (error) {
+    console.error(`Error opening audio data: ${error.message}`);
+    ws.close(1000, 'Client aborted');
+    process.exit(1);
+  }
   start = Date.now();
 
   readStream.on('data', async (chunk) => {
@@ -191,8 +223,11 @@ ws.on('error', (error) => {
 
 ws.on('close', (code, reason) => {
   console.log('\nFinished: ' + (Date.now() - start) + ' ms');
-  if (code !== 1000) {
-    console.log(`Connection closed with code: ${code}, reason: ${reason}`);
+  if (code === 1000) {
+    process.exit(0);
   }
-  process.exit();
+  // Exiting non-zero matters: without it a capacity rejection or an
+  // unsupported-language close is indistinguishable from a clean run.
+  describeClose(code, reason);
+  process.exit(1);
 });
