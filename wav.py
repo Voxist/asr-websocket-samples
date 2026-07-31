@@ -30,7 +30,7 @@ class WavError(Exception):
 
 class WavInfo:
     def __init__(self, audio_format, channels, sample_rate, bits_per_sample, sub_format,
-                 data_offset, data_size):
+                 data_offset, data_size, truncated=False, declared_data_size=None):
         self.audio_format = audio_format
         self.channels = channels
         self.sample_rate = sample_rate
@@ -38,6 +38,8 @@ class WavInfo:
         self.sub_format = sub_format
         self.data_offset = data_offset
         self.data_size = data_size
+        self.truncated = truncated
+        self.declared_data_size = declared_data_size
 
 
 def read_wav_info(file_path):
@@ -85,13 +87,22 @@ def read_wav_info(file_path):
                 if fmt is None:
                     raise WavError('data chunk found before fmt chunk')
                 remaining = max(0, file_size - body_offset)
-                if chunk_size in (0, SIZE_UNKNOWN) or chunk_size > remaining:
+                length_unknown = chunk_size in (0, SIZE_UNKNOWN)
+                if length_unknown or chunk_size > remaining:
                     data_size = remaining
                 else:
                     data_size = chunk_size
                 if data_size == 0:
                     raise WavError('file contains no audio data')
-                return WavInfo(data_offset=body_offset, data_size=data_size, **fmt)
+                # Truncation can only be detected here, where the declared
+                # length and the bytes actually present are both known.
+                return WavInfo(
+                    data_offset=body_offset,
+                    data_size=data_size,
+                    truncated=(not length_unknown and chunk_size > remaining),
+                    declared_data_size=None if length_unknown else chunk_size,
+                    **fmt,
+                )
 
             # Chunks are word-aligned: an odd size is followed by a pad byte.
             offset = body_offset + chunk_size + (chunk_size % 2)

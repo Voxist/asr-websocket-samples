@@ -467,7 +467,7 @@ simply quiet. On macOS in particular, a denied microphone permission produces
 
 | Symptom | What the client does |
 |---|---|
-| No audio within 4 s of starting | Prints the likely causes with platform-specific steps, and exits 1 |
+| No audio within 20 s of starting | Prints the likely causes with platform-specific steps, and exits 1. The window is long enough to answer the macOS permission dialog |
 | SoX binary missing | Prints install instructions for your platform, and exits 1 |
 | SoX exits before delivering audio | Reports the exit code and the same guidance, and exits 1 |
 | Device delivers all-zero samples | Warns that the transcription will be empty, and continues |
@@ -594,6 +594,8 @@ this README listed `sv` as a supported streaming language; that was incorrect.
 
 ### For File-based Transcription
 - Format: WAV (the script streams the PCM payload, not the container)
+- A file whose header declares more audio than it contains is rejected before
+  connecting, rather than transcribed into a silently partial result
 - Sample Rate: 16000 Hz — the server does not resample
 - Channels: Mono (1 channel)
 - Bit Depth: 16-bit

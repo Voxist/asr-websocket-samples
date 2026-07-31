@@ -81,6 +81,17 @@ try {
   process.exit(1);
 }
 
+// The parser is the only place that can tell a truncated file from a complete
+// one, because it sees the declared length before clamping it to reality.
+if (wavInfo.truncated) {
+  console.error(
+    `Error: ${wavFilePath} is truncated - the header declares ` +
+      `${wavInfo.declaredDataSize} audio bytes but only ${wavInfo.dataSize} are present.`,
+  );
+  console.error('Transcribing it would silently return a partial result.');
+  process.exit(1);
+}
+
 // Select the appropriate domain based on staging flag.
 // VOXIST_ASR_URL overrides the base URL entirely (self-hosted gateway, local tests).
 const domain = isStaging ? 'asr-staging-dev.voxist.com' : 'api-asr.voxist.com';
@@ -107,7 +118,6 @@ let receivedFinal = false;
 let doneSent = false;
 let drainTimedOut = false;
 let readFailed = false;
-let bytesSent = 0;
 let drainTimer = null;
 
 // Clear current line and move cursor to beginning.
@@ -144,7 +154,6 @@ ws.on('open', async () => {
   readStream.on('data', async (chunk) => {
     if (ws.readyState === WebSocket.OPEN) {
       readStream.pause();
-      bytesSent += chunk.length;
       ws.send(chunk);
       await new Promise((resolve) => setTimeout(resolve, CHUNK_DURATION_MS));
       readStream.resume();
@@ -152,15 +161,6 @@ ws.on('open', async () => {
   });
 
   readStream.on('end', () => {
-    // A short read ends the stream normally, so without this check a file
-    // truncated underneath us would flush, transcribe a fragment, and exit 0.
-    if (bytesSent < wavInfo.dataSize) {
-      console.error(
-        `\nWarning: sent ${bytesSent} of ${wavInfo.dataSize} declared audio bytes ` +
-          '- the file was shorter than its header claims.',
-      );
-      readFailed = true;
-    }
     if (ws.readyState === WebSocket.OPEN) {
       // End-of-stream signal. This MUST be the text frame `Done`: it is what
       // flushes the decoder's tail and promotes the last partial to a final.
@@ -185,13 +185,24 @@ ws.on('open', async () => {
     // ws.close() surfaces locally as 1005, which reads as a clean shutdown.
     console.error(`Error reading file: ${error.message}`);
     readFailed = true;
-    ws.close(1000, 'Client read error');
+    // Flush anyway: the audio already streamed is still in the engine's buffer,
+    // and `Done` returns it as a partial transcript instead of discarding it.
+    // The Python client does the same, so both recover the same output.
+    if (ws.readyState === WebSocket.OPEN && !doneSent) {
+      ws.send('Done');
+      doneSent = true;
+    } else {
+      ws.close(1000, 'Client read error');
+    }
   });
 });
 
 ws.on('message', (data) => {
   try {
     let message = JSON.parse(data);
+    // A final with empty text is still a final: silence, or audio the model did
+    // not recognise, is a correct outcome and must not read as a failed run.
+    if (message.type === 'final') receivedFinal = true;
     // Not every server message is a transcript: `text` may be absent entirely.
     if (typeof message.text === 'string' && message.text !== '') {
       if (first) {
@@ -204,7 +215,6 @@ ws.on('message', (data) => {
         clearLine();
         process.stdout.write(message.text);
       } else if (message.type === 'final') {
-        receivedFinal = true;
         // Clear the partial result and print final result on new line
         clearLine();
         // Only print if it's a new segment
@@ -238,7 +248,7 @@ ws.on('close', (code, reason) => {
   // Reporting the code matters: without it a capacity rejection or an
   // unsupported-language close is indistinguishable from a clean run.
   if (shouldReportClose(code, status)) describeClose(code, reason);
-  if (status !== 0 && !doneSent && !readFailed) {
+  if (status !== 0 && !doneSent) {
     console.log('  The audio was not fully sent - the transcript is incomplete.');
   }
   if (status !== 0 && !receivedFinal) console.log('  No final transcription was received.');

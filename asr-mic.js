@@ -68,10 +68,12 @@ console.log('');
 
 // Function to get websocket URL with temporary token
 async function getWebSocketURL() {
+  let fetchTimeout = null;
   try {
     console.log('Requesting websocket URL with temporary token...');
-    // Without this an unreachable host hangs before the socket is ever opened.
-    const fetchTimeout = setTimeout(() => startupAbort.abort(), 10000);
+    // Covers the body read as well as the headers: a proxy that returns 200
+    // and then stalls the body would otherwise hang with no diagnostic.
+    fetchTimeout = setTimeout(() => startupAbort.abort(), 10000);
 
     const response = await fetch(`${apiBaseUrl}/websocket?engine=voxist-rt-2`, {
       method: 'GET',
@@ -88,7 +90,7 @@ async function getWebSocketURL() {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
 
-    clearTimeout(fetchTimeout);
+
     const data = await response.json();
 
     if (!data.url) {
@@ -115,6 +117,8 @@ async function getWebSocketURL() {
     console.error(`Failed to get websocket URL: ${error.message}`);
     console.error('Make sure your API key is valid and you have the correct permissions');
     process.exit(1);
+  } finally {
+    if (fetchTimeout) clearTimeout(fetchTimeout);
   }
 }
 
@@ -169,14 +173,14 @@ let flushTimer = null;
 
 // How long to wait for the engine's tail after `Done` before giving up. The
 // server normally closes first; this is only a backstop against a hung session.
-const DRAIN_TIMEOUT_MS = 15000;
+const DRAIN_TIMEOUT_MS = 30000;
 // Backstop for the recorder's stream never emitting `end` after being killed.
 const FLUSH_TIMEOUT_MS = 1000;
 // How long to wait for the first audio byte before assuming the microphone is
 // unavailable. node-audiorecorder passes `-V0` to SoX, which suppresses its
 // error output, so a blocked device is indistinguishable from a silent one:
 // on macOS a denied permission simply yields no bytes at all, forever.
-const NO_AUDIO_TIMEOUT_MS = 4000;
+const NO_AUDIO_TIMEOUT_MS = 20000;
 // Window used to spot a device that is delivering digital silence rather than
 // nothing. A real microphone in a quiet room still produces low-level noise;
 // exactly-zero samples mean muted or blocked input.
@@ -202,6 +206,8 @@ function explainNoAudio() {
   console.error(`\nNo audio received from the microphone after ${NO_AUDIO_TIMEOUT_MS} ms.`);
   console.error('');
   console.error('SoX started successfully but produced no data. Common causes:');
+  console.error('  - A microphone permission dialog may still be open. Answer it,');
+  console.error('    then run this command again.');
   const help = MIC_HELP[process.platform];
   if (help) console.error(help);
   console.error('  - Another application may be holding the input device exclusively.');
@@ -218,10 +224,13 @@ function explainNoAudio() {
 // exactly once per session.
 function sendDone() {
   if (doneSent) return;
-  doneSent = true;
+  // Set only after the frame is actually on the wire: the success rule reads
+  // doneSent as "the input was flushed", so claiming it for a send that never
+  // happened would report an unflushed session as a complete one.
   if (!ws || ws.readyState !== websocket.OPEN) return;
 
   ws.send('Done');
+  doneSent = true;
 
   // Backstop for every flush path, not just Ctrl+C. If the gateway's upstream
   // engine socket was not OPEN when `Done` arrived it drops the flush and never
@@ -380,6 +389,14 @@ async function startTranscription() {
         });
 
         readStream.on('error', (error) => {
+          // Killing SoX can surface as EPIPE/ECONNRESET on its stdout instead of
+          // a clean `end`, routinely so on Windows. When we asked for the stop,
+          // that is expected: let the flush finish rather than aborting the
+          // drain and losing the tail we are shutting down to preserve.
+          if (recorderStopRequested || shuttingDown || finished) {
+            sendDone();
+            return;
+          }
           console.error(`Microphone error: ${error.message}`);
           cleanup(1);
         });
@@ -393,6 +410,9 @@ async function startTranscription() {
     ws.on('message', (data) => {
       try {
         let message = JSON.parse(data);
+        // A final with empty text is still a final: a silent or unrecognised
+        // recording is a correct outcome, not a failed run.
+        if (message.type === 'final') receivedFinal = true;
         // Not every server message is a transcript: `text` may be absent.
         if (typeof message.text === 'string' && message.text !== '') {
           if (first) {
@@ -405,7 +425,6 @@ async function startTranscription() {
             clearLine();
             process.stdout.write(`[LIVE] ${message.text}`);
           } else if (message.type === 'final') {
-            receivedFinal = true;
             // Clear the partial result and print final result on new line
             clearLine();
             // Only print if it's a new segment

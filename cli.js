@@ -44,10 +44,14 @@ export function describeClose(code, reason) {
  * mid-upload teardown is not.
  */
 export function closeExitCode(code, { doneSent = false, receivedFinal = false } = {}) {
-  if (CLOSE_EXPLANATIONS[code]) return 1; // documented server-side failure
   if (code === ABNORMAL_CLOSE) return 1; // no close frame: torn down, not finished
-  if (!doneSent) return 1; // input was never fully sent
+  if (!doneSent) return 1; // the flush was never sent, so nothing was finalised
   if (!receivedFinal) return 1; // nothing was transcribed
+  // A session that flushed and got its transcript succeeded, whatever code it
+  // ended on: the gateway relays the upstream engine's code verbatim, so an
+  // engine draining and closing 1011 during a rolling restart is not a failure
+  // for a caller that already holds the complete result. The 1008/1011/1013
+  // rejections that matter all happen before `Done`, and are caught above.
   return 0;
 }
 
