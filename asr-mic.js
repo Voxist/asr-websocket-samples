@@ -140,6 +140,13 @@ let first = true;
 let lastSegment = null;
 let recording = false;
 let doneSent = false;
+let noAudioTimer = null;
+// Once a failure is recorded it must not be downgraded: cleanup() closes the
+// socket, whose close handler calls cleanup() again with the (clean) code.
+let failureCode = 0;
+let audioSeen = false;
+let silenceCheckedBytes = 0;
+let silenceCheckNonZero = 0;
 let drainTimedOut = false;
 let receivedFinal = false;
 let shuttingDown = false;
@@ -151,6 +158,46 @@ let flushTimer = null;
 const DRAIN_TIMEOUT_MS = 15000;
 // Backstop for the recorder's stream never emitting `end` after being killed.
 const FLUSH_TIMEOUT_MS = 1000;
+// How long to wait for the first audio byte before assuming the microphone is
+// unavailable. node-audiorecorder passes `-V0` to SoX, which suppresses its
+// error output, so a blocked device is indistinguishable from a silent one:
+// on macOS a denied permission simply yields no bytes at all, forever.
+const NO_AUDIO_TIMEOUT_MS = 4000;
+// Window used to spot a device that is delivering digital silence rather than
+// nothing. A real microphone in a quiet room still produces low-level noise;
+// exactly-zero samples mean muted or blocked input.
+const SILENCE_CHECK_BYTES = SAMPLE_RATE * 2 * 2; // 2 seconds
+
+const MIC_HELP = {
+  darwin:
+    '  - macOS gates microphone access per application. Open System Settings >\n' +
+    '    Privacy & Security > Microphone and enable it for your terminal\n' +
+    '    (Terminal, iTerm, VS Code, ...). The very first run may have shown a\n' +
+    '    permission prompt; if it was dismissed, no audio is delivered and SoX\n' +
+    '    reports no error.',
+  linux:
+    '  - Check that a capture device exists (`arecord -l`) and that your user is\n' +
+    '    in the `audio` group. Under PulseAudio/PipeWire, confirm the default\n' +
+    '    source is not muted (`pactl list sources short`).',
+  win32:
+    '  - Open Settings > Privacy > Microphone and allow desktop apps to access\n' +
+    '    the microphone.',
+};
+
+function explainNoAudio() {
+  console.error(`\nNo audio received from the microphone after ${NO_AUDIO_TIMEOUT_MS} ms.`);
+  console.error('');
+  console.error('SoX started successfully but produced no data. Common causes:');
+  const help = MIC_HELP[process.platform];
+  if (help) console.error(help);
+  console.error('  - Another application may be holding the input device exclusively.');
+  console.error('  - The selected input device may not support 16 kHz mono capture.');
+  console.error('');
+  console.error('To see the underlying SoX error, run the same capture without `-V0`,');
+  console.error('which this recorder passes and which silences SoX diagnostics:');
+  console.error(`  sox -d -q -c 1 -r ${SAMPLE_RATE} -t raw -L -b 16 -e signed-integer - > /tmp/mic-test.raw`);
+  console.error('A working microphone produces 32000 bytes per second.');
+}
 
 // The gateway matches on `text.includes('Done')` and, per `Done`, emits a usage
 // analytics event and forwards another flush upstream — so it must be sent
@@ -179,6 +226,30 @@ function sendDone() {
   }, DRAIN_TIMEOUT_MS);
 }
 
+/**
+ * Warn once if the opening seconds of capture are exactly zero.
+ *
+ * A live microphone in a silent room still yields low-level noise, so an
+ * all-zero stream means the device is muted or the OS is feeding us silence
+ * rather than denying access outright.
+ */
+function checkForDigitalSilence(chunk) {
+  if (silenceCheckedBytes >= SILENCE_CHECK_BYTES) return;
+
+  for (let i = 0; i + 1 < chunk.length; i += 2) {
+    if (chunk.readInt16LE(i) !== 0) silenceCheckNonZero++;
+  }
+  silenceCheckedBytes += chunk.length;
+
+  if (silenceCheckedBytes >= SILENCE_CHECK_BYTES && silenceCheckNonZero === 0) {
+    console.warn('');
+    console.warn('Warning: the microphone is delivering digital silence (all samples zero).');
+    console.warn('The transcription will be empty. Check that the input device is not muted');
+    console.warn('and that this terminal is allowed to use the microphone.');
+    console.warn('');
+  }
+}
+
 function stopRecording() {
   if (!recording) return;
   recording = false;
@@ -199,6 +270,31 @@ const clearLine = () => {
     process.stdout.write('\n');
   }
 };
+
+// These arrive asynchronously on the recorder, so the try/catch around
+// `start()` cannot see them - a missing SoX binary surfaces here, not there.
+audioRecorder.on('error', (error) => {
+  if (error && error.code === 'ENOENT') {
+    console.error(`\nCould not start '${audioRecorder._options?.program || 'sox'}': command not found.`);
+    console.error('SoX is required for microphone capture. Install it with:');
+    console.error('  macOS:  brew install sox');
+    console.error('  Linux:  sudo apt-get install sox libsox-fmt-all');
+    console.error('  Windows: https://sourceforge.net/projects/sox/files/latest/download');
+  } else {
+    console.error(`\nMicrophone process error: ${error?.message || error}`);
+  }
+  cleanup(1);
+});
+
+audioRecorder.on('close', (exitCode) => {
+  // A non-zero exit before any audio arrived means SoX could not open the
+  // device at all; `-V0` means it exited without telling us why.
+  if (exitCode !== 0 && !audioSeen && !shuttingDown) {
+    console.error(`\nMicrophone process exited with code ${exitCode} before delivering any audio.`);
+    explainNoAudio();
+    cleanup(1);
+  }
+});
 
 // Main function to start the microphone transcription
 async function startTranscription() {
@@ -224,7 +320,21 @@ async function startTranscription() {
         start = Date.now();
         recording = true;
 
+        // If the device never delivers a byte, say so instead of streaming
+        // silence and reporting a successful, empty transcription.
+        noAudioTimer = setTimeout(() => {
+          explainNoAudio();
+          cleanup(1);
+        }, NO_AUDIO_TIMEOUT_MS);
+
         readStream.on('data', (chunk) => {
+          if (!audioSeen) {
+            audioSeen = true;
+            clearTimeout(noAudioTimer);
+            noAudioTimer = null;
+          }
+          checkForDigitalSilence(chunk);
+
           // Never send audio after `Done`: the engine is already draining and
           // trailing frames would be dropped, or worse, restart the segment.
           if (!doneSent && ws.readyState === websocket.OPEN) {
@@ -308,8 +418,10 @@ async function startTranscription() {
 
 // Cleanup function
 function cleanup(exitCode = 0) {
+  if (exitCode !== 0) failureCode = exitCode;
   if (drainTimer) clearTimeout(drainTimer);
   if (flushTimer) clearTimeout(flushTimer);
+  if (noAudioTimer) clearTimeout(noAudioTimer);
   if (recording) {
     console.log('\nStopping microphone recording...');
     stopRecording();
@@ -319,7 +431,7 @@ function cleanup(exitCode = 0) {
   }
   // Setting exitCode rather than calling process.exit() keeps queued stdout
   // from being truncated when output is piped.
-  exitCleanly(exitCode);
+  exitCleanly(failureCode || exitCode);
 }
 
 // Handle graceful shutdown

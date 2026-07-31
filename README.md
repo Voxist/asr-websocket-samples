@@ -458,6 +458,31 @@ node asr-mic.js your-prod-api-key en
 - Working microphone
 - Microphone permissions granted to terminal/application
 
+**Troubleshooting a silent microphone**
+
+`node-audiorecorder` invokes SoX with `-V0`, which suppresses SoX's own error
+output, so a device that cannot be opened looks exactly like a device that is
+simply quiet. On macOS in particular, a denied microphone permission produces
+*no bytes at all* and no error. The client therefore detects this itself:
+
+| Symptom | What the client does |
+|---|---|
+| No audio within 4 s of starting | Prints the likely causes with platform-specific steps, and exits 1 |
+| SoX binary missing | Prints install instructions for your platform, and exits 1 |
+| SoX exits before delivering audio | Reports the exit code and the same guidance, and exits 1 |
+| Device delivers all-zero samples | Warns that the transcription will be empty, and continues |
+
+The first run on macOS may raise a permission prompt. If it is dismissed, grant
+access under **System Settings > Privacy & Security > Microphone** for your
+terminal application. To see what SoX itself is complaining about, run the
+capture without `-V0`:
+
+```bash
+sox -d -q -c 1 -r 16000 -t raw -L -b 16 -e signed-integer - > /tmp/mic-test.raw
+```
+
+A working microphone produces 32000 bytes per second.
+
 **How it works:**
 1. Requests a temporary WebSocket token from the API using your API key
 2. Adds language and sample rate parameters to the WebSocket URL
