@@ -79,12 +79,14 @@ class ASRWebSocketClient:
         # The parser is the only place that can tell a truncated file from a
         # complete one, because it sees the declared length before clamping it.
         if self.wav_info.truncated:
-            raise WavError(
-                f'{self.wav_file_path} is truncated - the header declares '
-                f'{self.wav_info.declared_data_size} audio bytes but only '
-                f'{self.wav_info.data_size} are present.\n'
-                'Transcribing it would silently return a partial result.'
-            )
+            # Warn and transcribe anyway: the audio that IS present is still
+            # worth recovering. The non-zero exit is what stops a caller
+            # treating the partial result as complete.
+            print(f'Warning: {self.wav_file_path} is truncated - the header declares '
+                  f'{self.wav_info.declared_data_size} audio bytes but only '
+                  f'{self.wav_info.data_size} are present.')
+            print('Transcribing the audio that is present; the result will be partial.')
+            self.read_failed = True
 
     async def send_audio_chunks(self, websocket):
         """Stream the `data` chunk in real-time-sized pieces.
@@ -102,6 +104,13 @@ class ASRWebSocketClient:
                 while remaining > 0:
                     chunk = f.read(min(self.CHUNK_SIZE, remaining))
                     if not chunk:
+                        # The parser check catches a file that was already short
+                        # when we started; this catches one that shrinks while we
+                        # stream it - a different window, not a duplicate.
+                        print(f"\nWarning: sent {self.wav_info.data_size - remaining} of "
+                              f"{self.wav_info.data_size} audio bytes - the file was "
+                              "truncated while it was being streamed.")
+                        self.read_failed = True
                         break
                     remaining -= len(chunk)
 
@@ -163,21 +172,28 @@ class ASRWebSocketClient:
             print(f"Error handling message: {e}")
 
     def close_exit_code(self, code):
-        """Mirror of cli.js closeExitCode - keep the two in step.
+        """Same decision as cli.js closeExitCode; keep the two rules in step.
 
-        Success means the session completed: the whole file was sent (so `Done`
-        was issued), a final came back, and the connection did not die
-        abnormally. A close code alone cannot express that.
+        The inputs are read from `self` here and passed as an options object in
+        JavaScript, so the signatures differ deliberately - it is the ORDER and
+        the outcomes that must match, not the call shape.
+
+        Deliberately conservative: a false failure costs a re-run, while a false
+        success archives a truncated transcript as if it were complete. The
+        client cannot tell whether a transcript is complete, so a documented
+        server-side failure code fails the run even when results already
+        arrived.
         """
+        if self.read_failed:  # the input was not fully delivered
+            return 1
+        if code in (1008, 1011, 1013):  # documented server-side failure
+            return 1
         if code == 1006:  # no close frame: torn down, not finished
             return 1
-        if self.read_failed or not self.done_sent:
+        if not self.done_sent:
             return 1
         if not self.received_final:
             return 1
-        # A session that flushed and got its transcript succeeded, whatever code
-        # it ended on: the gateway relays the upstream engine's code verbatim.
-        # The 1008/1011/1013 rejections that matter all happen before `Done`.
         return 0
 
     def report_close(self, exc):

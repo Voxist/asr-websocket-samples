@@ -159,6 +159,8 @@ let failureCode = 0;
 let finished = false;
 // True when we killed the recorder ourselves: its exit is then expected.
 let recorderStopRequested = false;
+// A capture fault that cost us audio, even if it arrived while shutting down.
+let deviceFailed = false;
 // Ctrl+C before the socket exists must still abort the startup in flight.
 let startupAborted = false;
 const startupAbort = new AbortController();
@@ -394,6 +396,12 @@ async function startTranscription() {
           // that is expected: let the flush finish rather than aborting the
           // drain and losing the tail we are shutting down to preserve.
           if (recorderStopRequested || shuttingDown || finished) {
+            // Expected when we killed SoX ourselves (EPIPE on its stdout,
+            // routinely on Windows), so keep draining rather than aborting the
+            // flush. But a real device fault here - a USB mic unplugged during
+            // shutdown - drops buffered audio, so the run is still a failure.
+            console.error(`Microphone error during shutdown: ${error.message}`);
+            deviceFailed = true;
             sendDone();
             return;
           }
@@ -452,7 +460,7 @@ async function startTranscription() {
         cleanup(1);
         return;
       }
-      const status = closeExitCode(code, { doneSent, receivedFinal });
+      const status = closeExitCode(code, { doneSent, receivedFinal, readFailed: deviceFailed });
       if (shouldReportClose(code, status)) describeClose(code, reason);
       cleanup(status);
     });

@@ -467,14 +467,16 @@ simply quiet. On macOS in particular, a denied microphone permission produces
 
 | Symptom | What the client does |
 |---|---|
-| No audio within 20 s of starting | Prints the likely causes with platform-specific steps, and exits 1. The window is long enough to answer the macOS permission dialog |
+| No audio within 20 s of starting | Prints the likely causes with platform-specific steps, and exits 1 |
 | SoX binary missing | Prints install instructions for your platform, and exits 1 |
 | SoX exits before delivering audio | Reports the exit code and the same guidance, and exits 1 |
 | Device delivers all-zero samples | Warns that the transcription will be empty, and continues |
 
-The first run on macOS may raise a permission prompt. If it is dismissed, grant
+The first run on macOS raises a permission prompt. Granting it does **not**
+retroactively deliver audio to the SoX process that is already running, so
+answer the prompt and then start the client again. If it was dismissed, grant
 access under **System Settings > Privacy & Security > Microphone** for your
-terminal application. To see what SoX itself is complaining about, run the
+terminal application first. To see what SoX itself is complaining about, run the
 capture without `-V0`:
 
 ```bash
@@ -594,8 +596,9 @@ this README listed `sv` as a supported streaming language; that was incorrect.
 
 ### For File-based Transcription
 - Format: WAV (the script streams the PCM payload, not the container)
-- A file whose header declares more audio than it contains is rejected before
-  connecting, rather than transcribed into a silently partial result
+- A file whose header declares more audio than it contains is transcribed as far
+  as it goes, with a warning and a non-zero exit, so a partial result is never
+  mistaken for a complete one
 - Sample Rate: 16000 Hz — the server does not resample
 - Channels: Mono (1 channel)
 - Bit Depth: 16-bit
