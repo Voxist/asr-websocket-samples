@@ -1,6 +1,6 @@
 import websocket from 'ws';
 import AudioRecorder from 'node-audiorecorder';
-import { closeExitCode, describeClose, exitCleanly, parsePunctuationMode } from './cli.js';
+import { closeExitCode, describeClose, exitCleanly, parsePunctuationMode, shouldReportClose } from './cli.js';
 
 // Only 16 kHz is served by the streaming engines. The gateway does not resample.
 const SAMPLE_RATE = 16000;
@@ -70,6 +70,8 @@ console.log('');
 async function getWebSocketURL() {
   try {
     console.log('Requesting websocket URL with temporary token...');
+    // Without this an unreachable host hangs before the socket is ever opened.
+    const fetchTimeout = setTimeout(() => startupAbort.abort(), 10000);
 
     const response = await fetch(`${apiBaseUrl}/websocket?engine=voxist-rt-2`, {
       method: 'GET',
@@ -77,14 +79,16 @@ async function getWebSocketURL() {
         accept: 'application/json',
         'X-LVL-KEY': apiKey,
       },
-      // Without this an unreachable host hangs before the socket is ever opened.
-      signal: AbortSignal.timeout(10000),
+      // Abortable both by timeout and by Ctrl+C during startup. (A manual
+      // controller rather than AbortSignal.any, which needs Node 20.)
+      signal: startupAbort.signal,
     });
 
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
 
+    clearTimeout(fetchTimeout);
     const data = await response.json();
 
     if (!data.url) {
@@ -107,6 +111,7 @@ async function getWebSocketURL() {
 
     return wsUrl.toString();
   } catch (error) {
+    if (startupAborted) return null; // interrupted on purpose; not an error
     console.error(`Failed to get websocket URL: ${error.message}`);
     console.error('Make sure your API key is valid and you have the correct permissions');
     process.exit(1);
@@ -144,6 +149,15 @@ let noAudioTimer = null;
 // Once a failure is recorded it must not be downgraded: cleanup() closes the
 // socket, whose close handler calls cleanup() again with the (clean) code.
 let failureCode = 0;
+// Set as soon as any terminal path begins, so asynchronous events that arrive
+// afterwards (notably the recorder's `close`) do not diagnose a shutdown we
+// caused as a microphone fault.
+let finished = false;
+// True when we killed the recorder ourselves: its exit is then expected.
+let recorderStopRequested = false;
+// Ctrl+C before the socket exists must still abort the startup in flight.
+let startupAborted = false;
+const startupAbort = new AbortController();
 let audioSeen = false;
 let silenceCheckedBytes = 0;
 let silenceCheckNonZero = 0;
@@ -253,6 +267,7 @@ function checkForDigitalSilence(chunk) {
 function stopRecording() {
   if (!recording) return;
   recording = false;
+  recorderStopRequested = true;
   try {
     audioRecorder.stop();
   } catch (error) {
@@ -288,8 +303,11 @@ audioRecorder.on('error', (error) => {
 
 audioRecorder.on('close', (exitCode) => {
   // A non-zero exit before any audio arrived means SoX could not open the
-  // device at all; `-V0` means it exited without telling us why.
-  if (exitCode !== 0 && !audioSeen && !shuttingDown) {
+  // device at all; `-V0` means it exited without telling us why. But a stop we
+  // requested also reports a non-zero (null) code, and this event arrives a tick
+  // after cleanup() — without these guards a server-side rejection would be
+  // misreported as a microphone permission problem.
+  if (exitCode !== 0 && !audioSeen && !shuttingDown && !finished && !recorderStopRequested) {
     console.error(`\nMicrophone process exited with code ${exitCode} before delivering any audio.`);
     explainNoAudio();
     cleanup(1);
@@ -301,6 +319,9 @@ async function startTranscription() {
   try {
     // Get the websocket URL with temporary token
     const wsUrl = await getWebSocketURL();
+    // The user may have interrupted while the token request was in flight.
+    // Opening the microphone after that would record someone who asked to stop.
+    if (startupAborted || !wsUrl) return;
     const redacted = new URL(wsUrl);
     console.log(
       `Connecting to: ${redacted.origin}${redacted.pathname}?token=***&lang=${lang}&sample_rate=${SAMPLE_RATE}`,
@@ -310,6 +331,10 @@ async function startTranscription() {
     ws = new websocket(wsUrl);
 
     ws.on('open', () => {
+      if (startupAborted) {
+        ws.close(1000, 'Client interrupted during startup');
+        return;
+      }
       console.log('Connected to WebSocket');
       console.log('Starting microphone recording...');
       console.log('Press Ctrl+C to stop recording and disconnect');
@@ -323,6 +348,8 @@ async function startTranscription() {
         // If the device never delivers a byte, say so instead of streaming
         // silence and reporting a successful, empty transcription.
         noAudioTimer = setTimeout(() => {
+          // A deliberate shutdown is not a microphone fault.
+          if (shuttingDown || finished) return;
           explainNoAudio();
           cleanup(1);
         }, NO_AUDIO_TIMEOUT_MS);
@@ -406,8 +433,8 @@ async function startTranscription() {
         cleanup(1);
         return;
       }
-      const status = closeExitCode(code, receivedFinal);
-      if (status !== 0) describeClose(code, reason);
+      const status = closeExitCode(code, { doneSent, receivedFinal });
+      if (shouldReportClose(code, status)) describeClose(code, reason);
       cleanup(status);
     });
   } catch (error) {
@@ -419,6 +446,9 @@ async function startTranscription() {
 // Cleanup function
 function cleanup(exitCode = 0) {
   if (exitCode !== 0) failureCode = exitCode;
+  if (finished) return;
+  finished = true;
+
   if (drainTimer) clearTimeout(drainTimer);
   if (flushTimer) clearTimeout(flushTimer);
   if (noAudioTimer) clearTimeout(noAudioTimer);
@@ -429,8 +459,9 @@ function cleanup(exitCode = 0) {
   if (ws && (ws.readyState === websocket.OPEN || ws.readyState === websocket.CONNECTING)) {
     ws.close(1000, 'Client exiting');
   }
-  // Setting exitCode rather than calling process.exit() keeps queued stdout
-  // from being truncated when output is piped.
+  // exitCleanly() sets process.exitCode so piped output is not truncated, and
+  // arms an unref'd force-exit so a lingering handle (a capture process that
+  // ignores SIGTERM) cannot leave the client running with its signals trapped.
   exitCleanly(failureCode || exitCode);
 }
 
@@ -445,24 +476,31 @@ process.on('SIGINT', () => {
   shuttingDown = true;
   console.log('\nReceived SIGINT, shutting down gracefully...');
 
+  // Interrupted before the socket exists: abort the startup in flight, or it
+  // would go on to open the microphone after the user asked to stop.
   if (!ws || ws.readyState !== websocket.OPEN) {
+    startupAborted = true;
+    startupAbort.abort();
     cleanup(130);
     return;
   }
 
   // Stop the microphone and let the stream's `end` event send `Done`, so any
   // audio still buffered in sox's stdout reaches the engine before the flush.
-  // Stop the microphone and let the stream's `end` event send `Done`, so any
-  // audio still buffered in sox's stdout reaches the engine before the flush.
   // sendDone() arms the drain backstop; we then wait for the server's close,
-  // which is what guarantees the last `final` has been delivered.
+  // which is what guarantees the last `final` has been delivered. The no-audio
+  // watchdog is irrelevant now and would otherwise fire mid-drain.
+  if (noAudioTimer) {
+    clearTimeout(noAudioTimer);
+    noAudioTimer = null;
+  }
   stopRecording();
   flushTimer = setTimeout(sendDone, FLUSH_TIMEOUT_MS);
 });
 
 // SIGTERM (docker stop, kubectl delete pod, systemd, `timeout`) takes the same
 // path as Ctrl+C. Calling process.exit() in this tick would discard the queued
-// `Done` frame and lose the tail — the defect this client exists to avoid.
+// `Done` frame and lose the tail - the defect this client exists to avoid.
 process.on('SIGTERM', () => {
   if (shuttingDown) {
     cleanup(143);
@@ -472,8 +510,14 @@ process.on('SIGTERM', () => {
   console.log('\nReceived SIGTERM, shutting down gracefully...');
 
   if (!ws || ws.readyState !== websocket.OPEN) {
+    startupAborted = true;
+    startupAbort.abort();
     cleanup(143);
     return;
+  }
+  if (noAudioTimer) {
+    clearTimeout(noAudioTimer);
+    noAudioTimer = null;
   }
   stopRecording();
   flushTimer = setTimeout(sendDone, FLUSH_TIMEOUT_MS);

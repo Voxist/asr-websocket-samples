@@ -29,7 +29,10 @@ export function readWavInfo(filePath) {
     if (fs.readSync(fd, header, 0, 12, 0) < 12) {
       throw new Error('file is too short to be a WAV file');
     }
-    if (header.toString('ascii', 0, 4) !== 'RIFF' || header.toString('ascii', 8, 12) !== 'WAVE') {
+    // 'latin1', not 'ascii': Node's ascii decoder masks bit 7, so 0xD2 0xC9
+    // 0xC6 0xC6 would compare equal to "RIFF" and a corrupt file would be
+    // streamed to the gateway as PCM garbage. wav.py compares raw bytes.
+    if (header.toString('latin1', 0, 4) !== 'RIFF' || header.toString('latin1', 8, 12) !== 'WAVE') {
       throw new Error('not a RIFF/WAVE file');
     }
 
@@ -38,7 +41,7 @@ export function readWavInfo(filePath) {
     const chunkHeader = Buffer.alloc(8);
 
     while (offset + 8 <= fileSize && fs.readSync(fd, chunkHeader, 0, 8, offset) === 8) {
-      const chunkId = chunkHeader.toString('ascii', 0, 4);
+      const chunkId = chunkHeader.toString('latin1', 0, 4);
       const chunkSize = chunkHeader.readUInt32LE(4);
       const bodyOffset = offset + 8;
 

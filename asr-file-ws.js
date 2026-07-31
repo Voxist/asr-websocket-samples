@@ -1,7 +1,7 @@
 import WebSocket from 'ws';
 import fs from 'fs';
 import { readWavInfo, assertStreamable } from './wav.js';
-import { closeExitCode, describeClose, exitCleanly, parsePunctuationMode } from './cli.js';
+import { closeExitCode, describeClose, exitCleanly, parsePunctuationMode, shouldReportClose } from './cli.js';
 
 // If the gateway's upstream engine socket is not yet OPEN when `Done` arrives,
 // the gateway drops the flush and never closes us (gateway `Done` handler), so
@@ -99,14 +99,15 @@ console.log(`Chunk size: ${CHUNK_SIZE} bytes`);
 console.log('');
 
 
-const CLEAN_CODES = new Set([1000, 1005]);
-
 const ws = new WebSocket(url);
 let start = Date.now();
 let first = true;
 let lastSegment = null;
 let receivedFinal = false;
+let doneSent = false;
 let drainTimedOut = false;
+let readFailed = false;
+let bytesSent = 0;
 let drainTimer = null;
 
 // Clear current line and move cursor to beginning.
@@ -143,6 +144,7 @@ ws.on('open', async () => {
   readStream.on('data', async (chunk) => {
     if (ws.readyState === WebSocket.OPEN) {
       readStream.pause();
+      bytesSent += chunk.length;
       ws.send(chunk);
       await new Promise((resolve) => setTimeout(resolve, CHUNK_DURATION_MS));
       readStream.resume();
@@ -150,12 +152,22 @@ ws.on('open', async () => {
   });
 
   readStream.on('end', () => {
+    // A short read ends the stream normally, so without this check a file
+    // truncated underneath us would flush, transcribe a fragment, and exit 0.
+    if (bytesSent < wavInfo.dataSize) {
+      console.error(
+        `\nWarning: sent ${bytesSent} of ${wavInfo.dataSize} declared audio bytes ` +
+          '- the file was shorter than its header claims.',
+      );
+      readFailed = true;
+    }
     if (ws.readyState === WebSocket.OPEN) {
       // End-of-stream signal. This MUST be the text frame `Done`: it is what
       // flushes the decoder's tail and promotes the last partial to a final.
       // The server then closes the socket once the engine has drained, so we
       // wait for `close` rather than hanging up ourselves.
       ws.send('Done');
+      doneSent = true;
 
       // Backstop: if the gateway dropped the flush (upstream engine still
       // connecting) it will never close us, and this would otherwise hang.
@@ -169,8 +181,11 @@ ws.on('open', async () => {
   });
 
   readStream.on('error', (error) => {
+    // A partial upload is a failed run. Close with an explicit code: a bare
+    // ws.close() surfaces locally as 1005, which reads as a clean shutdown.
     console.error(`Error reading file: ${error.message}`);
-    ws.close();
+    readFailed = true;
+    ws.close(1000, 'Client read error');
   });
 });
 
@@ -215,11 +230,17 @@ ws.on('close', (code, reason) => {
   if (drainTimer) clearTimeout(drainTimer);
   console.log('\nFinished: ' + (Date.now() - start) + ' ms');
 
-  // A drain timeout closes with 1000, but the run did not succeed.
-  const status = drainTimedOut ? 1 : closeExitCode(code, receivedFinal);
+  // A drain timeout or a read error closes with 1000, but the run did not
+  // succeed, so neither can be inferred from the close code alone.
+  const status =
+    drainTimedOut || readFailed ? 1 : closeExitCode(code, { doneSent, receivedFinal });
+
   // Reporting the code matters: without it a capacity rejection or an
   // unsupported-language close is indistinguishable from a clean run.
-  if (status !== 0 || !CLEAN_CODES.has(code)) describeClose(code, reason);
+  if (shouldReportClose(code, status)) describeClose(code, reason);
+  if (status !== 0 && !doneSent && !readFailed) {
+    console.log('  The audio was not fully sent - the transcript is incomplete.');
+  }
   if (status !== 0 && !receivedFinal) console.log('  No final transcription was received.');
   exitCleanly(status);
 });

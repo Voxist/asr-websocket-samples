@@ -60,6 +60,8 @@ class ASRWebSocketClient:
         self.first_word_received = False
         self.last_segment = None
         self.received_final = False
+        self.done_sent = False
+        self.read_failed = False
 
     def clear_line(self):
         """Clear current line and move cursor to beginning"""
@@ -91,6 +93,13 @@ class ASRWebSocketClient:
                 while remaining > 0:
                     chunk = f.read(min(self.CHUNK_SIZE, remaining))
                     if not chunk:
+                        # A short read ends the loop normally, so without this
+                        # a file truncated underneath us would flush, transcribe
+                        # a fragment, and exit 0.
+                        print(f"\nWarning: sent {self.wav_info.data_size - remaining} of "
+                              f"{self.wav_info.data_size} declared audio bytes - "
+                              "the file was shorter than its header claims.")
+                        self.read_failed = True
                         break
                     remaining -= len(chunk)
 
@@ -100,12 +109,18 @@ class ASRWebSocketClient:
             # File-read failures only. A ConnectionClosed raised by send() must
             # propagate: it carries the close code the caller reports.
             print(f"Error reading audio file: {e}")
-            return
+            self.read_failed = True
 
         # End-of-stream signal. This MUST be the text frame `Done`: it is what
         # flushes the decoder's tail and promotes the last partial to a final.
         # The server closes the socket once the engine has drained.
+        #
+        # Sent even after a read error: the audio already streamed is still in
+        # the engine's buffer, and flushing returns the partial transcript
+        # instead of discarding it. Without this the caller would also wait out
+        # the full drain timeout and then wrongly blame the server.
         await websocket.send('Done')
+        self.done_sent = True
 
     def handle_message(self, message_data):
         """Handle incoming WebSocket messages"""
@@ -139,6 +154,23 @@ class ASRWebSocketClient:
             print(f"Error: Could not parse message: {message_data}")
         except Exception as e:
             print(f"Error handling message: {e}")
+
+    def close_exit_code(self, code):
+        """Mirror of cli.js closeExitCode - keep the two in step.
+
+        Success means the session completed: the whole file was sent (so `Done`
+        was issued), a final came back, and the connection did not die
+        abnormally. A close code alone cannot express that.
+        """
+        if code in (1008, 1011, 1013):
+            return 1
+        if code == 1006:  # no close frame: torn down, not finished
+            return 1
+        if self.read_failed or not self.done_sent:
+            return 1
+        if not self.received_final:
+            return 1
+        return 0
 
     def report_close(self, exc):
         """Explain an abnormal close using the gateway's documented codes."""
@@ -206,21 +238,18 @@ class ASRWebSocketClient:
                     print(f"\nNo response from server {DRAIN_TIMEOUT_S} s after Done - closing.")
                     print('The final segment may be missing.')
                     exit_code = 1
+                else:
+                    exit_code = self.close_exit_code(1000)
 
-        except websockets.exceptions.ConnectionClosedOK:
-            pass
         except websockets.exceptions.ConnectionClosed as e:
-            # 1008 / 1011 / 1013 land here. Surfacing the code matters: without
-            # it a capacity rejection is indistinguishable from a clean run.
+            # Classify by code, not by exception class: websockets raises
+            # ConnectionClosedOK for both 1000 and 1001, which would silently
+            # pass a "going away" close that produced no transcript.
             code = getattr(e, 'code', None)
-            if code in CLEAN_CLOSE_CODES:
-                pass
-            elif code in (1008, 1011, 1013) or not self.received_final:
+            status = self.close_exit_code(code)
+            if status != 0 or code not in (1000, 1005):
                 self.report_close(e)
-                exit_code = 1
-            else:
-                # Relayed engine code, but the transcript did arrive.
-                self.report_close(e)
+            exit_code = status
         except OSError as e:
             print(f"Connection error: {e}")
             exit_code = 1
@@ -228,11 +257,16 @@ class ASRWebSocketClient:
             print(f"WebSocket error: {e}")
             exit_code = 1
         finally:
-            for task in (send_task, recv_task):
-                if task is not None and not task.done():
+            # Cancel what is still running, then await EVERY task. Awaiting only
+            # the unfinished ones leaves an already-failed task's exception
+            # unretrieved, and asyncio then dumps a traceback at GC time - right
+            # after the clean diagnostic report_close() exists to provide.
+            tasks = [t for t in (send_task, recv_task) if t is not None]
+            for task in tasks:
+                if not task.done():
                     task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await task
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             elapsed = int((time.time() - self.start_time) * 1000) if self.start_time else 0
             print(f'\nFinished: {elapsed} ms')
 

@@ -1,5 +1,5 @@
 /**
- * Shared CLI and close-code helpers for the JavaScript samples.
+ * Shared CLI, close-code and exit helpers for the JavaScript samples.
  * `asr-file-ws.js` and `asr-mic.js` both use these, so the two clients cannot
  * drift apart the way the WAV handling once did.
  */
@@ -14,9 +14,9 @@ export const CLOSE_EXPLANATIONS = {
   1013: 'Server at capacity - back off and retry',
 };
 
-// 1005 is "no status received", which the ws library reports for a close frame
-// carrying no code. Neither it nor 1000 indicates a problem.
-const CLEAN_CLOSE_CODES = new Set([1000, 1005]);
+// 1006 means the connection vanished without a close frame: a pod eviction, a
+// proxy idle timeout, a TCP reset. It is never a successful session.
+const ABNORMAL_CLOSE = 1006;
 
 export function describeClose(code, reason) {
   let detail = reason ? reason.toString() : '';
@@ -34,28 +34,44 @@ export function describeClose(code, reason) {
 }
 
 /**
- * Decide the process exit status for a close.
+ * Decide the process exit status for a finished session.
  *
- * A non-1000 code is not automatically a failure: the gateway relays the
- * upstream engine's close code verbatim, so a session that already delivered
- * its transcript can still end on an unusual code. Treat the run as successful
- * when a final result was received, and as a failure otherwise.
+ * Success means the session actually completed: the whole input was sent (so a
+ * `Done` flush was issued) AND at least one final result came back AND the
+ * connection did not die abnormally. A close code alone cannot express that —
+ * the gateway relays the upstream engine's code verbatim, so an unusual code
+ * after a complete transcript is fine, while a "clean-looking" code after a
+ * mid-upload teardown is not.
  */
-export function closeExitCode(code, receivedFinal) {
-  if (CLEAN_CLOSE_CODES.has(code)) return 0;
-  if (CLOSE_EXPLANATIONS[code]) return 1;
-  return receivedFinal ? 0 : 1;
+export function closeExitCode(code, { doneSent = false, receivedFinal = false } = {}) {
+  if (CLOSE_EXPLANATIONS[code]) return 1; // documented server-side failure
+  if (code === ABNORMAL_CLOSE) return 1; // no close frame: torn down, not finished
+  if (!doneSent) return 1; // input was never fully sent
+  if (!receivedFinal) return 1; // nothing was transcribed
+  return 0;
+}
+
+/** True when the close is worth explaining to the user. */
+export function shouldReportClose(code, status) {
+  return status !== 0 || !(code === 1000 || code === 1005);
 }
 
 /**
- * Exit without truncating output.
+ * End the process without truncating output, but never hang.
  *
  * `process.exit()` discards whatever is still queued on stdout when stdout is a
- * pipe or a file, which silently swallowed the close diagnostic under `| tee`.
- * Setting `exitCode` lets the process end once the event loop is empty.
+ * pipe or a file. Setting `exitCode` lets the loop drain first — but if some
+ * handle (a capture process that ignores SIGTERM, a socket that will not close)
+ * keeps the loop alive, the process would never exit at all, and because these
+ * clients trap SIGINT it could not even be interrupted. The unref'd timer is the
+ * backstop: it cannot by itself hold the process open, and it only fires if
+ * something else already is.
  */
-export function exitCleanly(code) {
+export function exitCleanly(code, forceAfterMs = 2000) {
   process.exitCode = code;
+  const timer = setTimeout(() => process.exit(code), forceAfterMs);
+  if (typeof timer.unref === 'function') timer.unref();
+  return timer;
 }
 
 /** Parse and validate `--punctuation-mode=MODE` / `--punctuation-mode MODE`. */
