@@ -81,6 +81,21 @@ try {
   process.exit(1);
 }
 
+// The parser is the only place that can tell a truncated file from a complete
+// one, because it sees the declared length before clamping it to reality.
+let readFailed = false;
+if (wavInfo.truncated) {
+  // Warn and transcribe anyway: the audio that IS present is still worth
+  // recovering (a killed recorder, an interrupted ffmpeg run). The non-zero
+  // exit is what stops a caller treating the partial result as complete.
+  console.error(
+    `Warning: ${wavFilePath} is truncated - the header declares ` +
+      `${wavInfo.declaredDataSize} audio bytes but only ${wavInfo.dataSize} are present.`,
+  );
+  console.error('Transcribing the audio that is present; the result will be partial.');
+  readFailed = true;
+}
+
 // Select the appropriate domain based on staging flag.
 // VOXIST_ASR_URL overrides the base URL entirely (self-hosted gateway, local tests).
 const domain = isStaging ? 'asr-staging-dev.voxist.com' : 'api-asr.voxist.com';
@@ -106,9 +121,8 @@ let lastSegment = null;
 let receivedFinal = false;
 let doneSent = false;
 let drainTimedOut = false;
-let readFailed = false;
-let bytesSent = 0;
 let drainTimer = null;
+let bytesSent = 0;
 
 // Clear current line and move cursor to beginning.
 // Guarded: these are TTY-only APIs and throw when stdout is a pipe or a file.
@@ -151,47 +165,67 @@ ws.on('open', async () => {
     }
   });
 
-  readStream.on('end', () => {
-    // A short read ends the stream normally, so without this check a file
-    // truncated underneath us would flush, transcribe a fragment, and exit 0.
-    if (bytesSent < wavInfo.dataSize) {
+  // The parser check above catches a file that was already short when we
+  // started; this catches one that shrinks while we stream it (logrotate,
+  // rsync --inplace, an in-place re-encode) — a different window, not a
+  // duplicate. Skipped when the socket is no longer OPEN, because then the
+  // shortfall is explained by the server closing, not by the file.
+  const checkShortRead = () => {
+    if (ws.readyState === WebSocket.OPEN && bytesSent < wavInfo.dataSize) {
       console.error(
-        `\nWarning: sent ${bytesSent} of ${wavInfo.dataSize} declared audio bytes ` +
-          '- the file was shorter than its header claims.',
+        `\nWarning: sent ${bytesSent} of ${wavInfo.dataSize} audio bytes - ` +
+          'the file was truncated while it was being streamed.',
       );
       readFailed = true;
     }
+  };
+
+  // Every flush goes through here so the drain backstop is always armed: an
+  // unbounded wait after `Done` is how the client used to hang forever.
+  const flushAndArmDrain = () => {
+    if (ws.readyState !== WebSocket.OPEN || doneSent) return;
+    ws.send('Done');
+    doneSent = true;
+    drainTimer = setTimeout(() => {
+      console.error(`\nNo response from server ${DRAIN_TIMEOUT_MS} ms after Done - closing.`);
+      console.error('The final segment may be missing.');
+      drainTimedOut = true;
+      ws.close(1000, 'Client drain timeout');
+    }, DRAIN_TIMEOUT_MS);
+  };
+
+  readStream.on('end', () => {
+    checkShortRead();
     if (ws.readyState === WebSocket.OPEN) {
       // End-of-stream signal. This MUST be the text frame `Done`: it is what
       // flushes the decoder's tail and promotes the last partial to a final.
-      // The server then closes the socket once the engine has drained, so we
-      // wait for `close` rather than hanging up ourselves.
-      ws.send('Done');
-      doneSent = true;
-
-      // Backstop: if the gateway dropped the flush (upstream engine still
-      // connecting) it will never close us, and this would otherwise hang.
-      drainTimer = setTimeout(() => {
-        console.error(`\nNo response from server ${DRAIN_TIMEOUT_MS} ms after Done - closing.`);
-        console.error('The final segment may be missing.');
-        drainTimedOut = true;
-        ws.close(1000, 'Client drain timeout');
-      }, DRAIN_TIMEOUT_MS);
+      // The server then closes the socket once the engine has drained.
+      flushAndArmDrain();
     }
   });
 
   readStream.on('error', (error) => {
-    // A partial upload is a failed run. Close with an explicit code: a bare
-    // ws.close() surfaces locally as 1005, which reads as a clean shutdown.
+    // A partial upload is a failed run, but the audio already streamed is still
+    // in the engine's buffer: flush so it comes back as a partial transcript
+    // rather than being discarded. The Python client does the same. Going
+    // through flushAndArmDrain() is what keeps this bounded — an errored stream
+    // never emits `end`, so nothing else would ever arm the backstop.
     console.error(`Error reading file: ${error.message}`);
     readFailed = true;
-    ws.close(1000, 'Client read error');
+    if (ws.readyState === WebSocket.OPEN && !doneSent) {
+      flushAndArmDrain();
+    } else if (ws.readyState === WebSocket.OPEN) {
+      ws.close(1000, 'Client read error');
+    }
   });
 });
 
 ws.on('message', (data) => {
   try {
     let message = JSON.parse(data);
+    // A final with empty text is still a final: silence, or audio the model did
+    // not recognise, is a correct outcome and must not read as a failed run.
+    if (message.type === 'final') receivedFinal = true;
     // Not every server message is a transcript: `text` may be absent entirely.
     if (typeof message.text === 'string' && message.text !== '') {
       if (first) {
@@ -204,7 +238,6 @@ ws.on('message', (data) => {
         clearLine();
         process.stdout.write(message.text);
       } else if (message.type === 'final') {
-        receivedFinal = true;
         // Clear the partial result and print final result on new line
         clearLine();
         // Only print if it's a new segment
@@ -232,13 +265,16 @@ ws.on('close', (code, reason) => {
 
   // A drain timeout or a read error closes with 1000, but the run did not
   // succeed, so neither can be inferred from the close code alone.
-  const status =
-    drainTimedOut || readFailed ? 1 : closeExitCode(code, { doneSent, receivedFinal });
+  const status = drainTimedOut
+    ? 1
+    : closeExitCode(code, { doneSent, receivedFinal, readFailed });
 
   // Reporting the code matters: without it a capacity rejection or an
   // unsupported-language close is indistinguishable from a clean run.
   if (shouldReportClose(code, status)) describeClose(code, reason);
-  if (status !== 0 && !doneSent && !readFailed) {
+  if (status !== 0 && readFailed) {
+    console.log('  The input audio was incomplete - the transcript is partial.');
+  } else if (status !== 0 && !doneSent) {
     console.log('  The audio was not fully sent - the transcript is incomplete.');
   }
   if (status !== 0 && !receivedFinal) console.log('  No final transcription was received.');

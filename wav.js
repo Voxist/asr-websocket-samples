@@ -70,12 +70,23 @@ export function readWavInfo(filePath) {
           throw new Error('data chunk found before fmt chunk');
         }
         const remaining = Math.max(0, fileSize - bodyOffset);
-        const dataSize =
-          chunkSize === 0 || chunkSize === SIZE_UNKNOWN || chunkSize > remaining ? remaining : chunkSize;
+        const lengthUnknown = chunkSize === 0 || chunkSize === SIZE_UNKNOWN;
+        const dataSize = lengthUnknown || chunkSize > remaining ? remaining : chunkSize;
         if (dataSize === 0) {
           throw new Error('file contains no audio data');
         }
-        return { ...fmt, dataOffset: bodyOffset, dataSize };
+        // Truncation can only be detected here, where the declared length and
+        // the bytes actually present are both known. Comparing bytes-sent
+        // against dataSize downstream cannot work: dataSize has already been
+        // clamped to what exists, and a mid-stream server close would look
+        // identical to a short file.
+        return {
+          ...fmt,
+          dataOffset: bodyOffset,
+          dataSize,
+          truncated: !lengthUnknown && chunkSize > remaining,
+          declaredDataSize: lengthUnknown ? null : chunkSize,
+        };
       }
 
       // Chunks are word-aligned: an odd size is followed by a pad byte.

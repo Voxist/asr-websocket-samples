@@ -36,17 +36,22 @@ export function describeClose(code, reason) {
 /**
  * Decide the process exit status for a finished session.
  *
- * Success means the session actually completed: the whole input was sent (so a
- * `Done` flush was issued) AND at least one final result came back AND the
- * connection did not die abnormally. A close code alone cannot express that —
- * the gateway relays the upstream engine's code verbatim, so an unusual code
- * after a complete transcript is fine, while a "clean-looking" code after a
- * mid-upload teardown is not.
+ * Deliberately conservative: a false failure costs a re-run, while a false
+ * success archives a truncated transcript as if it were complete. The client
+ * cannot actually tell whether a transcript is complete — it only knows it sent
+ * `Done` and saw at least one final — so a documented server-side failure code
+ * is treated as a failure even when some results already arrived. An engine
+ * evicted mid-drain relays 1011 after emitting three of sixty segments, and
+ * that is not a successful run.
  */
-export function closeExitCode(code, { doneSent = false, receivedFinal = false } = {}) {
+export function closeExitCode(
+  code,
+  { doneSent = false, receivedFinal = false, readFailed = false } = {},
+) {
+  if (readFailed) return 1; // the input was not fully delivered
   if (CLOSE_EXPLANATIONS[code]) return 1; // documented server-side failure
   if (code === ABNORMAL_CLOSE) return 1; // no close frame: torn down, not finished
-  if (!doneSent) return 1; // input was never fully sent
+  if (!doneSent) return 1; // the flush was never sent, so nothing was finalised
   if (!receivedFinal) return 1; // nothing was transcribed
   return 0;
 }
