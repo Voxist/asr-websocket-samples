@@ -178,7 +178,7 @@ To signal the end of audio and flush the final result, send the text frame:
 Done
 ```
 
-That is the literal five-byte string `Done`, sent as a text (not binary) frame:
+That is the literal four-byte string `Done`, sent as a text (not binary) frame:
 
 ```javascript
 websocket.send('Done');
@@ -188,6 +188,12 @@ The server forwards it to the engine, which drains its buffer, emits the last
 `final` message, and then closes the connection — so **wait for the `close`
 event** rather than closing the socket yourself. Hanging up early truncates the
 tail of your transcript.
+
+Bound that wait. The gateway only forwards `Done` if its upstream engine socket
+is already open; if the engine is still connecting — a cold start, or a clip
+short enough to finish first — the flush is dropped and no close ever arrives.
+The samples wait 30 seconds, then close themselves and report the missing tail
+rather than hanging.
 
 > **Breaking change (July 2026 samples update).** Earlier versions of these
 > samples sent `{"eof": 1}`. That message is not part of the protocol: the
@@ -332,7 +338,7 @@ Failures arrive as WebSocket close codes, not as JSON error messages:
 
 | Code | Meaning | What to do |
 |---|---|---|
-| `1008` | Unsupported language code, or a model your account is not entitled to | Check `lang` against the supported list |
+| `1008` | Unsupported language code, a model your account is not entitled to, or a per-tenant rate limit | Check `lang` against the supported list; back off if you are sending many sessions |
 | `1011` | Engine unavailable, engine timeout, or a language with no engine configured in this environment | Retry; escalate if persistent |
 | `1013` | Server at capacity. The close reason carries `{"error":"server_overloaded","retryAfterMs":3000}` | Back off and retry after the advertised delay |
 | `1006` (no handshake) | Rejected during the HTTP upgrade — bad or missing credentials | Check the API key / token and the target environment |
@@ -509,6 +515,14 @@ python asr-file-ws.py your-prod-api-key audio.wav en
 # Dictation mode: spoken punctuation becomes real punctuation
 python asr-file-ws.py your-prod-api-key audio.wav fr-medical --punctuation-mode=Dictated
 ```
+
+**Parameters:**
+- `API_KEY`: Your Voxist API key (different for staging and production)
+- `WAV_FILE`: Path to the WAV audio file (16 kHz mono 16-bit PCM; the script
+  validates this and streams the `data` chunk only)
+- `LANG`: Language code (optional, default: `fr`)
+- `--punctuation-mode`: `Generated` (default) or `Dictated` — see [Punctuation modes](#punctuation-modes)
+- `--staging`: Use staging environment (optional)
 
 ## Pointing the samples at another gateway
 

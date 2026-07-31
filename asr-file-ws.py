@@ -21,6 +21,16 @@ SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2
 CHUNK_DURATION_MS = 100
 
+# If the gateway's upstream engine socket is not yet OPEN when `Done` arrives,
+# the gateway drops the flush and never closes us, so waiting for the close
+# frame unconditionally would hang forever.
+DRAIN_TIMEOUT_S = 30
+
+# 1005 is "no status received". Neither it nor 1000 indicates a problem. Other
+# codes may be relayed verbatim from the upstream ASR engine, so they are only
+# treated as failures when no final result arrived.
+CLEAN_CLOSE_CODES = (1000, 1005)
+
 
 class ASRWebSocketClient:
     def __init__(self, wav_file_path, api_key, lang="fr", is_staging=False, punctuation_mode=None):
@@ -49,6 +59,7 @@ class ASRWebSocketClient:
         self.start_time = None
         self.first_word_received = False
         self.last_segment = None
+        self.received_final = False
 
     def clear_line(self):
         """Clear current line and move cursor to beginning"""
@@ -101,7 +112,9 @@ class ASRWebSocketClient:
         try:
             message = json.loads(message_data)
 
-            if message.get('text', '') != '':
+            # Not every server message is a transcript: `text` may be absent.
+            text = message.get('text')
+            if isinstance(text, str) and text != '':
                 if not self.first_word_received:
                     self.first_word_received = True
                     elapsed = int((time.time() - self.start_time) * 1000)
@@ -113,6 +126,7 @@ class ASRWebSocketClient:
                     print(message['text'], end='', flush=True)
 
                 elif message.get('type') == 'final':
+                    self.received_final = True
                     # Clear the partial result and print final result on new line
                     self.clear_line()
                     current_segment = message.get('segment')
@@ -142,7 +156,8 @@ class ASRWebSocketClient:
                 pass
 
         explanations = {
-            1008: 'Unsupported language code, or a model this account is not entitled to',
+            1008: ('Unsupported language code, a model this account is not entitled to, '
+                   'or a per-tenant rate limit'),
             1011: 'ASR engine unavailable, timed out, or not configured for this language',
             1013: 'Server at capacity - back off and retry',
         }
@@ -150,6 +165,11 @@ class ASRWebSocketClient:
               f"{' - ' + detail if detail else ''}")
         if code in explanations:
             print(f"  {explanations[code]}")
+
+    async def receive_messages(self, websocket):
+        """Consume server messages until the connection closes."""
+        async for message in websocket:
+            self.handle_message(message)
 
     async def run(self):
         """Run the WebSocket client. Returns a process exit status."""
@@ -164,28 +184,43 @@ class ASRWebSocketClient:
 
         exit_code = 0
         send_task = None
+        recv_task = None
 
         try:
             async with websockets.connect(self.url) as websocket:
                 print('Connected to WebSocket')
 
-                # Start sending audio chunks
+                # Receive concurrently with sending, so a close that arrives
+                # mid-stream is observed immediately rather than after the last
+                # chunk, and so the sender's own failures are not masked.
+                recv_task = asyncio.create_task(self.receive_messages(websocket))
                 send_task = asyncio.create_task(self.send_audio_chunks(websocket))
 
-                # Listen for messages until the server closes the connection,
-                # which it does once the engine has drained the tail.
-                async for message in websocket:
-                    self.handle_message(message)
-
                 await send_task
+
+                # `Done` has been sent; the server closes once the engine has
+                # drained. Bounded, because a dropped flush never closes.
+                try:
+                    await asyncio.wait_for(recv_task, timeout=DRAIN_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    print(f"\nNo response from server {DRAIN_TIMEOUT_S} s after Done - closing.")
+                    print('The final segment may be missing.')
+                    exit_code = 1
 
         except websockets.exceptions.ConnectionClosedOK:
             pass
         except websockets.exceptions.ConnectionClosed as e:
             # 1008 / 1011 / 1013 land here. Surfacing the code matters: without
             # it a capacity rejection is indistinguishable from a clean run.
-            self.report_close(e)
-            exit_code = 1
+            code = getattr(e, 'code', None)
+            if code in CLEAN_CLOSE_CODES:
+                pass
+            elif code in (1008, 1011, 1013) or not self.received_final:
+                self.report_close(e)
+                exit_code = 1
+            else:
+                # Relayed engine code, but the transcript did arrive.
+                self.report_close(e)
         except OSError as e:
             print(f"Connection error: {e}")
             exit_code = 1
@@ -193,10 +228,11 @@ class ASRWebSocketClient:
             print(f"WebSocket error: {e}")
             exit_code = 1
         finally:
-            if send_task is not None and not send_task.done():
-                send_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await send_task
+            for task in (send_task, recv_task):
+                if task is not None and not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
             elapsed = int((time.time() - self.start_time) * 1000) if self.start_time else 0
             print(f'\nFinished: {elapsed} ms')
 

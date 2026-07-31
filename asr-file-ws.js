@@ -1,6 +1,12 @@
 import WebSocket from 'ws';
 import fs from 'fs';
 import { readWavInfo, assertStreamable } from './wav.js';
+import { closeExitCode, describeClose, exitCleanly, parsePunctuationMode } from './cli.js';
+
+// If the gateway's upstream engine socket is not yet OPEN when `Done` arrives,
+// the gateway drops the flush and never closes us (gateway `Done` handler), so
+// waiting for the close frame unconditionally would hang forever.
+const DRAIN_TIMEOUT_MS = 30000;
 
 // Only 16 kHz is served by the streaming engines. The gateway does not resample,
 // so this is not a knob — it is a property of the audio you must supply.
@@ -20,17 +26,7 @@ if (isStaging) {
 }
 
 // Optional --punctuation-mode=Generated|Dictated
-let punctuationMode = null;
-const pmIndex = args.findIndex((a) => a.startsWith('--punctuation-mode'));
-if (pmIndex !== -1) {
-  const inline = args[pmIndex].split('=')[1];
-  punctuationMode = inline || args[pmIndex + 1];
-  args.splice(pmIndex, inline ? 1 : 2);
-  if (!['Generated', 'Dictated'].includes(punctuationMode)) {
-    console.error(`Error: --punctuation-mode must be Generated or Dictated (got "${punctuationMode}")`);
-    process.exit(1);
-  }
-}
+const punctuationMode = parsePunctuationMode(args);
 
 if (args.length < 2) {
   console.log('Usage: node asr-file-ws.js <API_KEY> <WAV_FILE> [LANG] [--punctuation-mode=MODE] [--staging]');
@@ -103,32 +99,15 @@ console.log(`Chunk size: ${CHUNK_SIZE} bytes`);
 console.log('');
 
 
-// The gateway reports failures as close codes, not as JSON error messages.
-const CLOSE_EXPLANATIONS = {
-  1008: 'Unsupported language code, or a model this account is not entitled to',
-  1011: 'ASR engine unavailable, timed out, or not configured for this language',
-  1013: 'Server at capacity - back off and retry',
-};
-
-function describeClose(code, reason) {
-  let detail = reason ? reason.toString() : '';
-  if (detail.startsWith('{')) {
-    try {
-      const payload = JSON.parse(detail);
-      detail = payload.message || detail;
-      if (payload.retryAfterMs) detail += ` (retry after ${payload.retryAfterMs} ms)`;
-    } catch {
-      /* not JSON */
-    }
-  }
-  console.log(`Connection closed by server: code ${code}${detail ? ' - ' + detail : ''}`);
-  if (CLOSE_EXPLANATIONS[code]) console.log(`  ${CLOSE_EXPLANATIONS[code]}`);
-}
+const CLEAN_CODES = new Set([1000, 1005]);
 
 const ws = new WebSocket(url);
 let start = Date.now();
 let first = true;
 let lastSegment = null;
+let receivedFinal = false;
+let drainTimedOut = false;
+let drainTimer = null;
 
 // Clear current line and move cursor to beginning.
 // Guarded: these are TTY-only APIs and throw when stdout is a pipe or a file.
@@ -177,6 +156,15 @@ ws.on('open', async () => {
       // The server then closes the socket once the engine has drained, so we
       // wait for `close` rather than hanging up ourselves.
       ws.send('Done');
+
+      // Backstop: if the gateway dropped the flush (upstream engine still
+      // connecting) it will never close us, and this would otherwise hang.
+      drainTimer = setTimeout(() => {
+        console.error(`\nNo response from server ${DRAIN_TIMEOUT_MS} ms after Done - closing.`);
+        console.error('The final segment may be missing.');
+        drainTimedOut = true;
+        ws.close(1000, 'Client drain timeout');
+      }, DRAIN_TIMEOUT_MS);
     }
   });
 
@@ -189,7 +177,8 @@ ws.on('open', async () => {
 ws.on('message', (data) => {
   try {
     let message = JSON.parse(data);
-    if (message.text !== '') {
+    // Not every server message is a transcript: `text` may be absent entirely.
+    if (typeof message.text === 'string' && message.text !== '') {
       if (first) {
         first = false;
         console.log('First word: ' + (Date.now() - start) + ' ms');
@@ -200,6 +189,7 @@ ws.on('message', (data) => {
         clearLine();
         process.stdout.write(message.text);
       } else if (message.type === 'final') {
+        receivedFinal = true;
         // Clear the partial result and print final result on new line
         clearLine();
         // Only print if it's a new segment
@@ -218,16 +208,18 @@ ws.on('message', (data) => {
 ws.on('error', (error) => {
   console.error(`WebSocket error: ${error.message}`);
   console.error(`Failed to connect to: ${baseUrl}/ws`);
-  process.exit(1);
+  exitCleanly(1);
 });
 
 ws.on('close', (code, reason) => {
+  if (drainTimer) clearTimeout(drainTimer);
   console.log('\nFinished: ' + (Date.now() - start) + ' ms');
-  if (code === 1000) {
-    process.exit(0);
-  }
-  // Exiting non-zero matters: without it a capacity rejection or an
+
+  // A drain timeout closes with 1000, but the run did not succeed.
+  const status = drainTimedOut ? 1 : closeExitCode(code, receivedFinal);
+  // Reporting the code matters: without it a capacity rejection or an
   // unsupported-language close is indistinguishable from a clean run.
-  describeClose(code, reason);
-  process.exit(1);
+  if (status !== 0 || !CLEAN_CODES.has(code)) describeClose(code, reason);
+  if (status !== 0 && !receivedFinal) console.log('  No final transcription was received.');
+  exitCleanly(status);
 });

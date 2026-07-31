@@ -112,10 +112,12 @@ def assert_streamable(info, expected_sample_rate):
     # it for ordinary PCM, so judge it by its SubFormat rather than rejecting it.
     effective_format = info.sub_format if info.audio_format == FORMAT_EXTENSIBLE else info.audio_format
     if effective_format != FORMAT_PCM:
-        if info.audio_format == FORMAT_EXTENSIBLE:
-            problems.append(f'extensible WAV carrying a non-PCM codec (SubFormat {info.sub_format})')
-        else:
+        if info.audio_format != FORMAT_EXTENSIBLE:
             problems.append(f'not uncompressed PCM (format {info.audio_format})')
+        elif info.sub_format is None:
+            problems.append('extensible WAV whose fmt chunk is too short to declare a SubFormat')
+        else:
+            problems.append(f'extensible WAV carrying a non-PCM codec (SubFormat {info.sub_format})')
     if info.channels != 1:
         problems.append(f'{info.channels} channels, expected mono')
     if info.bits_per_sample != 16:

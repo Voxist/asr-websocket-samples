@@ -1,5 +1,6 @@
 import websocket from 'ws';
 import AudioRecorder from 'node-audiorecorder';
+import { closeExitCode, describeClose, exitCleanly, parsePunctuationMode } from './cli.js';
 
 // Only 16 kHz is served by the streaming engines. The gateway does not resample.
 const SAMPLE_RATE = 16000;
@@ -15,17 +16,7 @@ if (isStaging) {
 }
 
 // Optional --punctuation-mode=Generated|Dictated
-let punctuationMode = null;
-const pmIndex = args.findIndex((a) => a.startsWith('--punctuation-mode'));
-if (pmIndex !== -1) {
-  const inline = args[pmIndex].split('=')[1];
-  punctuationMode = inline || args[pmIndex + 1];
-  args.splice(pmIndex, inline ? 1 : 2);
-  if (!['Generated', 'Dictated'].includes(punctuationMode)) {
-    console.error(`Error: --punctuation-mode must be Generated or Dictated (got "${punctuationMode}")`);
-    process.exit(1);
-  }
-}
+const punctuationMode = parsePunctuationMode(args);
 
 if (args.length < 1) {
   console.log('Usage: node asr-mic.js <API_KEY> [LANG] [--punctuation-mode=MODE] [--staging]');
@@ -86,6 +77,8 @@ async function getWebSocketURL() {
         accept: 'application/json',
         'X-LVL-KEY': apiKey,
       },
+      // Without this an unreachable host hangs before the socket is ever opened.
+      signal: AbortSignal.timeout(10000),
     });
 
     if (!response.ok) {
@@ -130,7 +123,6 @@ const audioRecorder = new AudioRecorder(
     bits: 16,
     channels: 1,
     encoding: 'signed-integer',
-    format: 'S16_LE',
     rate: SAMPLE_RATE,
     type: 'raw',
     silence: 0,
@@ -142,34 +134,14 @@ const audioRecorder = new AudioRecorder(
 );
 
 
-// The gateway reports failures as close codes, not as JSON error messages.
-const CLOSE_EXPLANATIONS = {
-  1008: 'Unsupported language code, or a model this account is not entitled to',
-  1011: 'ASR engine unavailable, timed out, or not configured for this language',
-  1013: 'Server at capacity - back off and retry',
-};
-
-function describeClose(code, reason) {
-  let detail = reason ? reason.toString() : '';
-  if (detail.startsWith('{')) {
-    try {
-      const payload = JSON.parse(detail);
-      detail = payload.message || detail;
-      if (payload.retryAfterMs) detail += ` (retry after ${payload.retryAfterMs} ms)`;
-    } catch {
-      /* not JSON */
-    }
-  }
-  console.log(`Connection closed by server: code ${code}${detail ? ' - ' + detail : ''}`);
-  if (CLOSE_EXPLANATIONS[code]) console.log(`  ${CLOSE_EXPLANATIONS[code]}`);
-}
-
 let ws;
 let start = Date.now();
 let first = true;
 let lastSegment = null;
 let recording = false;
 let doneSent = false;
+let drainTimedOut = false;
+let receivedFinal = false;
 let shuttingDown = false;
 let drainTimer = null;
 let flushTimer = null;
@@ -186,9 +158,25 @@ const FLUSH_TIMEOUT_MS = 1000;
 function sendDone() {
   if (doneSent) return;
   doneSent = true;
-  if (ws && ws.readyState === websocket.OPEN) {
-    ws.send('Done');
-  }
+  if (!ws || ws.readyState !== websocket.OPEN) return;
+
+  ws.send('Done');
+
+  // Backstop for every flush path, not just Ctrl+C. If the gateway's upstream
+  // engine socket was not OPEN when `Done` arrived it drops the flush and never
+  // closes us, so waiting unconditionally would hang forever.
+  if (drainTimer) clearTimeout(drainTimer);
+  console.log('Waiting for the final transcription result...');
+  drainTimer = setTimeout(() => {
+    console.error(`\nNo response from server ${DRAIN_TIMEOUT_MS} ms after Done - closing.`);
+    console.error('The final segment may be missing.');
+    drainTimedOut = true;
+    if (ws.readyState === websocket.OPEN) {
+      ws.close(1000, 'Client drain timeout');
+    } else {
+      cleanup(1);
+    }
+  }, DRAIN_TIMEOUT_MS);
 }
 
 function stopRecording() {
@@ -237,7 +225,9 @@ async function startTranscription() {
         recording = true;
 
         readStream.on('data', (chunk) => {
-          if (ws.readyState === websocket.OPEN) {
+          // Never send audio after `Done`: the engine is already draining and
+          // trailing frames would be dropped, or worse, restart the segment.
+          if (!doneSent && ws.readyState === websocket.OPEN) {
             ws.send(chunk);
           }
         });
@@ -266,7 +256,8 @@ async function startTranscription() {
     ws.on('message', (data) => {
       try {
         let message = JSON.parse(data);
-        if (message.text !== '') {
+        // Not every server message is a transcript: `text` may be absent.
+        if (typeof message.text === 'string' && message.text !== '') {
           if (first) {
             first = false;
             console.log('First word: ' + (Date.now() - start) + ' ms');
@@ -277,6 +268,7 @@ async function startTranscription() {
             clearLine();
             process.stdout.write(`[LIVE] ${message.text}`);
           } else if (message.type === 'final') {
+            receivedFinal = true;
             // Clear the partial result and print final result on new line
             clearLine();
             // Only print if it's a new segment
@@ -300,12 +292,13 @@ async function startTranscription() {
     ws.on('close', (code, reason) => {
       console.log('\nWebSocket connection closed');
       console.log('Total session time: ' + (Date.now() - start) + ' ms');
-      if (code === 1000) {
-        cleanup(0);
+      if (drainTimedOut) {
+        cleanup(1);
         return;
       }
-      describeClose(code, reason);
-      cleanup(1);
+      const status = closeExitCode(code, receivedFinal);
+      if (status !== 0) describeClose(code, reason);
+      cleanup(status);
     });
   } catch (error) {
     console.error(`Error starting transcription: ${error.message}`);
@@ -321,7 +314,12 @@ function cleanup(exitCode = 0) {
     console.log('\nStopping microphone recording...');
     stopRecording();
   }
-  process.exit(exitCode);
+  if (ws && (ws.readyState === websocket.OPEN || ws.readyState === websocket.CONNECTING)) {
+    ws.close(1000, 'Client exiting');
+  }
+  // Setting exitCode rather than calling process.exit() keeps queued stdout
+  // from being truncated when output is piped.
+  exitCleanly(exitCode);
 }
 
 // Handle graceful shutdown
@@ -342,30 +340,31 @@ process.on('SIGINT', () => {
 
   // Stop the microphone and let the stream's `end` event send `Done`, so any
   // audio still buffered in sox's stdout reaches the engine before the flush.
+  // Stop the microphone and let the stream's `end` event send `Done`, so any
+  // audio still buffered in sox's stdout reaches the engine before the flush.
+  // sendDone() arms the drain backstop; we then wait for the server's close,
+  // which is what guarantees the last `final` has been delivered.
   stopRecording();
   flushTimer = setTimeout(sendDone, FLUSH_TIMEOUT_MS);
-
-  // Then wait for the server to close: that is what guarantees the last `final`
-  // has been delivered. Close cleanly ourselves only if it never arrives.
-  console.log('Waiting for the final transcription result...');
-  drainTimer = setTimeout(() => {
-    console.log(`No close from server after ${DRAIN_TIMEOUT_MS} ms - closing`);
-    if (ws.readyState === websocket.OPEN) {
-      ws.close(1000, 'Client drain timeout');
-    } else {
-      cleanup(0);
-    }
-  }, DRAIN_TIMEOUT_MS);
 });
 
+// SIGTERM (docker stop, kubectl delete pod, systemd, `timeout`) takes the same
+// path as Ctrl+C. Calling process.exit() in this tick would discard the queued
+// `Done` frame and lose the tail — the defect this client exists to avoid.
 process.on('SIGTERM', () => {
-  console.log('\nReceived SIGTERM, shutting down...');
-  stopRecording();
-  if (ws && ws.readyState === websocket.OPEN) {
-    sendDone();
-    ws.close(1000, 'Client terminated');
+  if (shuttingDown) {
+    cleanup(143);
+    return;
   }
-  cleanup(143);
+  shuttingDown = true;
+  console.log('\nReceived SIGTERM, shutting down gracefully...');
+
+  if (!ws || ws.readyState !== websocket.OPEN) {
+    cleanup(143);
+    return;
+  }
+  stopRecording();
+  flushTimer = setTimeout(sendDone, FLUSH_TIMEOUT_MS);
 });
 
 // Start the transcription

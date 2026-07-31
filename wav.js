@@ -99,11 +99,13 @@ export function assertStreamable(info, expectedSampleRate) {
   // it for ordinary PCM, so judge it by its SubFormat rather than rejecting it.
   const effectiveFormat = info.audioFormat === FORMAT_EXTENSIBLE ? info.subFormat : info.audioFormat;
   if (effectiveFormat !== FORMAT_PCM) {
-    problems.push(
-      info.audioFormat === FORMAT_EXTENSIBLE
-        ? `extensible WAV carrying a non-PCM codec (SubFormat ${info.subFormat})`
-        : `not uncompressed PCM (format ${info.audioFormat})`,
-    );
+    if (info.audioFormat !== FORMAT_EXTENSIBLE) {
+      problems.push(`not uncompressed PCM (format ${info.audioFormat})`);
+    } else if (info.subFormat === null) {
+      problems.push('extensible WAV whose fmt chunk is too short to declare a SubFormat');
+    } else {
+      problems.push(`extensible WAV carrying a non-PCM codec (SubFormat ${info.subFormat})`);
+    }
   }
   if (info.channels !== 1) problems.push(`${info.channels} channels, expected mono`);
   if (info.bitsPerSample !== 16) problems.push(`${info.bitsPerSample}-bit, expected 16-bit`);
