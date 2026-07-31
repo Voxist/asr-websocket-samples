@@ -49,15 +49,42 @@ curl -X 'GET' \
 wss://api-asr.voxist.com/ws?token=JWT_TOKEN&lang=fr-medical&sample_rate=16000
 ```
 
+Prefer this method for browsers and any client you do not fully control: the
+token is short-lived (1 hour) and does not expose your long-lived API key.
+
+#### Connection parameters
+
+| Parameter | Required | Description |
+|---|---|---|
+| `api_key` or `token` | yes | Authentication. Exactly one of the two. |
+| `lang` | no | Language / model. If omitted, the connection waits for a `config` message before it accepts audio — any audio sent before then is **discarded**. |
+| `sample_rate` | no | Defaults to `16000`. See the note under [Audio Format](#audio-format). |
+| `punctuation_mode` | no | `Generated` (default) or `Dictated`. See [Punctuation modes](#punctuation-modes). |
+
 ### Audio Format
 
 Send raw audio data directly to the WebSocket:
 
-- **Format**: Raw PCM audio bytes
+- **Format**: Raw PCM audio bytes — **not** a WAV file. Locate the `data` chunk
+  and send its contents only; the server forwards every binary frame straight to
+  the decoder, so header bytes on the wire are decoded as if they were audio.
+  Do **not** assume a fixed 44-byte header: a `LIST`/`INFO` chunk (what ffmpeg
+  writes by default, and what most DAW exports carry) pushes `data` further in,
+  and skipping a fixed 44 bytes then misaligns every sample. `wav.js` / `wav.py`
+  in this repo walk the chunk list for exactly this reason.
 - **Encoding**: Signed 16-bit little-endian
 - **Channels**: Mono (1 channel)
-- **Sample Rate**: 8000 Hz or 16000 Hz (specified in connection URL)
-- **Chunk Size**: Recommended 100ms chunks (3200 bytes for 16kHz, 1600 bytes for 8kHz)
+- **Sample Rate**: 16000 Hz
+- **Chunk Size**: Recommended 100ms chunks (3200 bytes at 16kHz)
+
+> **The server does not resample.** `sample_rate` in the connection URL is used
+> for duration accounting, not for conversion, and the streaming engines are
+> 16 kHz models. Sending 8 kHz audio does not fail — it returns a confidently
+> wrong transcript. Convert before you stream:
+>
+> ```bash
+> ffmpeg -i input.wav -ac 1 -ar 16000 -sample_fmt s16 output.wav
+> ```
 
 ### Real-time Streaming
 
@@ -82,15 +109,98 @@ setInterval(() => {
 }, CHUNK_DURATION_MS);
 ```
 
-### End of Transcription
+### Configuring mid-session
 
-To signal the end of audio and complete the transcription:
+Instead of (or in addition to) URL parameters, send a JSON **text** frame:
 
 ```json
-{"eof": 1}
+{
+  "config": {
+    "lang": "fr-medical",
+    "sample_rate": 16000,
+    "punctuation_mode": "Generated"
+  }
+}
 ```
 
-Send this JSON message when you finish sending audio data.
+This is also how you change settings on a live connection. Changing `lang`
+transparently reconnects the session to the new engine — you do not need to open
+a new socket. If you connected without a `lang` URL parameter, this message is
+what unblocks audio processing.
+
+### Punctuation modes
+
+Transcripts are post-processed server-side before they reach you. Two modes are
+available, on every language:
+
+- **`Generated`** (default) — the pipeline inserts punctuation and casing for you.
+- **`Dictated`** — spoken punctuation commands ("point", "virgule", "à la ligne")
+  are converted into the corresponding marks instead of being transcribed as
+  words. This is the mode to use for dictation workflows.
+
+Set it in the URL (`&punctuation_mode=Dictated`) or in a `config` message, and
+change it mid-session with another `config` message:
+
+```json
+{ "config": { "punctuation_mode": "Dictated" } }
+```
+
+The same pipeline applies number formatting, and on the medical models, unit
+normalization.
+
+### Custom vocabulary
+
+Per-session term replacements are applied at the end of the text pipeline — use
+them for names, local jargon, or product terms the model spells differently:
+
+```json
+{
+  "config": {
+    "user_vocabulary": [
+      { "pattern": "petite soeur", "replacement": "MySys", "case_sensitive": false }
+    ]
+  }
+}
+```
+
+- Literal matching only — a `pattern` is not a regular expression, and entries
+  flagged `is_regex` are dropped.
+- Up to **100 entries**; `pattern` and `replacement` are capped at **256 bytes** each.
+- Re-send at any point to replace the whole set; send an empty array to clear it.
+- Invalid entries are dropped individually rather than voiding the whole set,
+  and dropping is silent — there is no per-entry error response.
+
+### End of Transcription
+
+To signal the end of audio and flush the final result, send the text frame:
+
+```
+Done
+```
+
+That is the literal four-byte string `Done`, sent as a text (not binary) frame:
+
+```javascript
+websocket.send('Done');
+```
+
+The server forwards it to the engine, which drains its buffer, emits the last
+`final` message, and then closes the connection — so **wait for the `close`
+event** rather than closing the socket yourself. Hanging up early truncates the
+tail of your transcript.
+
+Bound that wait. The gateway only forwards `Done` if its upstream engine socket
+is already open; if the engine is still connecting — a cold start, or a clip
+short enough to finish first — the flush is dropped and no close ever arrives.
+The samples wait 30 seconds, then close themselves and report the missing tail
+rather than hanging.
+
+> **Breaking change (July 2026 samples update).** Earlier versions of these
+> samples sent `{"eof": 1}`. That message is not part of the protocol: the
+> server logs it as an unknown text frame and discards it. The result is a
+> transcript missing its final segment and a socket that stays open (and
+> metered) until the client gives up. If you copied that pattern, replace it
+> with `Done`.
 
 ### Response Format
 
@@ -100,6 +210,7 @@ The WebSocket returns JSON messages with transcription results. Both partial and
 ```json
 {
   "text": " Ceci est un te",
+  "transcript": " Ceci est un te",
   "type": "partial",
   "startedAt": 0,
   "segment": 0,
@@ -146,6 +257,7 @@ The WebSocket returns JSON messages with transcription results. Both partial and
 ```json
 {
   "text": " Ceci est un test",
+  "transcript": " Ceci est un test",
   "type": "final",
   "startedAt": 0,
   "segment": 0,
@@ -191,6 +303,10 @@ The WebSocket returns JSON messages with transcription results. Both partial and
 #### Response Fields
 
 - **`text`**: The transcribed text
+- **`transcript`**: Best-effort mirror of `text`, added by the server-side text
+  pipeline. It is absent when that pipeline passes a message through untouched
+  (empty text, or an internal processing error), so **read `text`** and treat
+  `transcript` as optional
 - **`type`**: `"partial"` for real-time updates, `"final"` for completed segments
 - **`startedAt`**: Start time of the segment in seconds
 - **`segment`**: Segment number (increments for each completed phrase/sentence)
@@ -198,23 +314,45 @@ The WebSocket returns JSON messages with transcription results. Both partial and
   - **`segments`**: Array of text segments with timing
   - **`words`**: Array of individual words with precise timestamps
 
-**Note**: The only difference between partial and final results is the `type` field. Partial results may have incomplete words (e.g., "te" instead of "test"), while final results contain the complete, corrected transcription.
+**Note**: Read `text`, not `transcript` — see the field list above. The only
+difference between partial and final results is the `type` field. Partial results may have incomplete words (e.g., "te" instead of "test"), while final results contain the complete, corrected transcription.
+
+Word-level timings inside `elements` are produced by the acoustic model and are
+not re-aligned after text post-processing, so on medical models the `text` may
+be normalized ("15 mg") where the corresponding `words` entries still carry the
+spoken tokens.
 
 ### Protocol Flow
 
 1. **Connect** to WebSocket with API key or token
-2. **Stream audio** in real-time chunks (100ms recommended)
-3. **Receive partial results** for immediate feedback
-4. **Receive final results** for completed segments with detailed timing
-5. **Send EOF** when finished
-6. **Close connection**
+2. *(optional)* **Send a `config` message** if you did not pass `lang` in the URL
+3. **Stream audio** in real-time chunks (100ms recommended)
+4. **Receive partial results** for immediate feedback
+5. **Receive final results** for completed segments with detailed timing
+6. **Send `Done`** when finished
+7. **Wait for the server to close** the connection
 
 ### Error Handling
 
-- **Authentication errors**: Check API key validity and permissions
-- **Connection errors**: Verify network connectivity and URL format
-- **Audio format errors**: Ensure correct sample rate and audio format
-- **Token expiry**: Temporary tokens expire after 1 hour
+Failures arrive as WebSocket close codes, not as JSON error messages:
+
+| Code | Meaning | What to do |
+|---|---|---|
+| `1008` | Unsupported language code, a model your account is not entitled to, or a per-tenant rate limit | Check `lang` against the supported list; back off if you are sending many sessions |
+| `1011` | Engine unavailable, engine timeout, or a language with no engine configured in this environment | Retry; escalate if persistent |
+| `1013` | Server at capacity. The close reason carries `{"error":"server_overloaded","retryAfterMs":3000}` | Back off and retry after the advertised delay |
+| `1006` (no handshake) | Rejected during the HTTP upgrade — bad or missing credentials | Check the API key / token and the target environment |
+
+All three scripts exit non-zero and print the code and reason on an abnormal
+close, so a wrapper script can tell a capacity rejection from a clean run.
+
+Other things to watch for:
+
+- **Audio sent before the connection is configured is dropped.** Pass `lang` in
+  the URL, or wait after sending your `config` message.
+- **Token expiry**: temporary tokens are valid for 1 hour. Long sessions should
+  reconnect with a fresh token.
+- **Audio format errors do not raise an error** — see the resampling note above.
 
 ## Dependencies
 
@@ -242,6 +380,8 @@ brew install sox
 
 ## JavaScript Setup
 
+Requires Node.js 18 or later (the microphone script uses the global `fetch`).
+
 ### Install dependencies
 
 ```bash
@@ -253,29 +393,30 @@ npm install
 Direct WebSocket connection using API key authentication with CLI parameters:
 
 ```bash
-node asr-file-ws.js <API_KEY> <WAV_FILE> [LANG] [SAMPLE_RATE] [--staging]
+node asr-file-ws.js <API_KEY> <WAV_FILE> [LANG] [--punctuation-mode=MODE] [--staging]
 ```
 
 **Examples:**
 ```bash
 # Production environment (default)
-node asr-file-ws.js your-prod-api-key audio.wav fr-medical 16000
+node asr-file-ws.js your-prod-api-key audio.wav fr-medical
 
 # Staging environment
-node asr-file-ws.js your-staging-api-key audio.wav fr-medical 16000 --staging
+node asr-file-ws.js your-staging-api-key audio.wav fr-medical --staging
 
-# Custom language and sample rate in production
-node asr-file-ws.js your-prod-api-key audio.wav fr 8000
+# English transcription in production
+node asr-file-ws.js your-prod-api-key audio.wav en
 
-# English transcription in staging
-node asr-file-ws.js your-staging-api-key audio.wav en 16000 --staging
+# Dictation mode: spoken punctuation becomes real punctuation
+node asr-file-ws.js your-prod-api-key audio.wav fr-medical --punctuation-mode=Dictated
 ```
 
 **Parameters:**
 - `API_KEY`: Your Voxist API key (different for staging and production)
-- `WAV_FILE`: Path to the WAV audio file
-- `LANG`: Language code (optional, default: "fr-medical")
-- `SAMPLE_RATE`: Sample rate in Hz (optional, default: 16000)
+- `WAV_FILE`: Path to the WAV audio file (16 kHz mono 16-bit PCM; the script
+  validates this and strips the WAV header before streaming)
+- `LANG`: Language code (optional, default: `fr`)
+- `--punctuation-mode`: `Generated` (default) or `Dictated` — see [Punctuation modes](#punctuation-modes)
 - `--staging`: Use staging environment (optional)
 
 ### asr-mic.js (Real-time Microphone Transcription)
@@ -283,43 +424,64 @@ node asr-file-ws.js your-staging-api-key audio.wav en 16000 --staging
 Real-time microphone transcription using WebSocket with temporary token authentication:
 
 ```bash
-node asr-mic.js <API_KEY> [LANG] [SAMPLE_RATE] [--staging]
+node asr-mic.js <API_KEY> [LANG] [--punctuation-mode=MODE] [--staging]
 ```
 
 **Examples:**
 ```bash
 # Production environment (default)
-node asr-mic.js your-prod-api-key fr-medical 16000
+node asr-mic.js your-prod-api-key fr-medical
 
 # Staging environment
-node asr-mic.js your-staging-api-key fr-medical 16000 --staging
+node asr-mic.js your-staging-api-key fr-medical --staging
 
-# Custom language and sample rate in production
-node asr-mic.js your-prod-api-key fr 8000
-
-# English transcription in staging
-node asr-mic.js your-staging-api-key en 16000 --staging
+# English transcription in production
+node asr-mic.js your-prod-api-key en
 ```
 
 **Parameters:**
 - `API_KEY`: Your Voxist API key (different for staging and production)
-- `LANG`: Language code (optional, default: "fr-medical")
-- `SAMPLE_RATE`: Sample rate in Hz (optional, default: 16000)
+- `LANG`: Language code (optional, default: `fr`)
+- `--punctuation-mode`: `Generated` (default) or `Dictated` — see [Punctuation modes](#punctuation-modes)
 - `--staging`: Use staging environment (optional)
 
 **Features:**
 - Real-time microphone recording and transcription
-- Automatic audio configuration (mono 16-bit at specified sample rate)
+- Records headerless mono 16-bit PCM at 16 kHz, ready to stream as-is
 - Temporary token authentication (more secure than direct API key in WebSocket)
 - Live partial results with `[LIVE]` prefix
 - Final results with `[FINAL]` prefix
-- Graceful shutdown with Ctrl+C
-- Proper microphone resource cleanup
+- Ctrl+C stops the microphone, flushes with `Done`, and waits for the last final
 
 **Requirements:**
 - **SoX must be installed** and available in PATH
 - Working microphone
 - Microphone permissions granted to terminal/application
+
+**Troubleshooting a silent microphone**
+
+`node-audiorecorder` invokes SoX with `-V0`, which suppresses SoX's own error
+output, so a device that cannot be opened looks exactly like a device that is
+simply quiet. On macOS in particular, a denied microphone permission produces
+*no bytes at all* and no error. The client therefore detects this itself:
+
+| Symptom | What the client does |
+|---|---|
+| No audio within 4 s of starting | Prints the likely causes with platform-specific steps, and exits 1 |
+| SoX binary missing | Prints install instructions for your platform, and exits 1 |
+| SoX exits before delivering audio | Reports the exit code and the same guidance, and exits 1 |
+| Device delivers all-zero samples | Warns that the transcription will be empty, and continues |
+
+The first run on macOS may raise a permission prompt. If it is dismissed, grant
+access under **System Settings > Privacy & Security > Microphone** for your
+terminal application. To see what SoX itself is complaining about, run the
+capture without `-V0`:
+
+```bash
+sox -d -q -c 1 -r 16000 -t raw -L -b 16 -e signed-integer - > /tmp/mic-test.raw
+```
+
+A working microphone produces 32000 bytes per second.
 
 **How it works:**
 1. Requests a temporary WebSocket token from the API using your API key
@@ -361,53 +523,84 @@ pip install -r requirements.txt
 #### asr-file-ws.py (Direct WebSocket with API Key)
 
 ```bash
-python asr-file-ws.py <API_KEY> <WAV_FILE> [LANG] [SAMPLE_RATE] [--staging]
+python asr-file-ws.py <API_KEY> <WAV_FILE> [LANG] [--punctuation-mode=MODE] [--staging]
 ```
 
 **Examples:**
 ```bash
 # Production environment (default)
-python asr-file-ws.py your-prod-api-key audio.wav fr-medical 16000
+python asr-file-ws.py your-prod-api-key audio.wav fr-medical
 
 # Staging environment
-python asr-file-ws.py your-staging-api-key audio.wav fr-medical 16000 --staging
+python asr-file-ws.py your-staging-api-key audio.wav fr-medical --staging
 
-# Custom language and sample rate in production
-python asr-file-ws.py your-prod-api-key audio.wav fr 8000
+# English transcription in production
+python asr-file-ws.py your-prod-api-key audio.wav en
 
-# English transcription in staging
-python asr-file-ws.py your-staging-api-key audio.wav en 16000 --staging
+# Dictation mode: spoken punctuation becomes real punctuation
+python asr-file-ws.py your-prod-api-key audio.wav fr-medical --punctuation-mode=Dictated
 ```
 
 **Parameters:**
 - `API_KEY`: Your Voxist API key (different for staging and production)
-- `WAV_FILE`: Path to the WAV audio file
-- `LANG`: Language code (optional, default: "fr-medical")
-- `SAMPLE_RATE`: Sample rate in Hz (optional, default: 16000)
+- `WAV_FILE`: Path to the WAV audio file (16 kHz mono 16-bit PCM; the script
+  validates this and streams the `data` chunk only)
+- `LANG`: Language code (optional, default: `fr`)
+- `--punctuation-mode`: `Generated` (default) or `Dictated` — see [Punctuation modes](#punctuation-modes)
 - `--staging`: Use staging environment (optional)
 
-**Supported Languages:**
-- `fr`: French
-- `fr-medical`: French Medical
-- `en`: English
-- `pt`: Portuguese
-- `nl`: Dutch
-- `it`: Italian
-- `sv`: Swedish
-- `es`: Spanish
-- `de`: German
+## Pointing the samples at another gateway
+
+All three scripts honour two optional environment variables, for self-hosted
+deployments and local testing:
+
+| Variable | Overrides |
+|---|---|
+| `VOXIST_ASR_URL` | WebSocket base URL (default `wss://api-asr.voxist.com`) |
+| `VOXIST_ASR_API_URL` | HTTP base URL used for the token request in `asr-mic.js` |
+
+```bash
+VOXIST_ASR_URL=ws://127.0.0.1:3000 node asr-file-ws.js your-api-key audio.wav fr
+```
+
+## Supported Languages
+
+Real-time streaming models available in production:
+
+| Code | Language |
+|---|---|
+| `fr` | French |
+| `fr-medical` | French Medical |
+| `fr-medicalV2-16` | French Medical, 16-frame latency tier |
+| `fr-medicalV2-32` | French Medical, 32-frame latency tier (same model as `fr-medical`) |
+| `fr-medicalV2-64` | French Medical, 64-frame latency tier |
+| `en` | English |
+| `de` | German |
+| `es` | Spanish |
+| `it` | Italian |
+| `nl` | Dutch |
+| `pt` | Portuguese |
+
+Region-qualified aliases (`fr-FR`, `en-US`, `de-DE`, `nl-NL`) are accepted and
+collapse to their base language.
+
+**Not available for streaming**: `sv`, `pl`, `ja`, `he`, `tr`. These codes are
+recognized by the API but have no streaming engine deployed in production today
+— a connection using them is closed with code `1011`. Swedish is available for
+**offline** (file upload) transcription via the REST API. Previous versions of
+this README listed `sv` as a supported streaming language; that was incorrect.
 
 ## Audio Requirements
 
 ### For File-based Transcription
-- Format: WAV
-- Sample Rate: 8000 Hz or 16000 Hz
+- Format: WAV (the script streams the PCM payload, not the container)
+- Sample Rate: 16000 Hz — the server does not resample
 - Channels: Mono (1 channel)
 - Bit Depth: 16-bit
 
 ### For Microphone Transcription
-- Automatically configured to mono 16-bit at specified sample rate
-- SoX handles audio format conversion
+- Automatically configured to headerless mono 16-bit PCM at 16 kHz
+- SoX handles audio capture and format conversion
 - Works with any microphone supported by the system
 
 ## API Keys
